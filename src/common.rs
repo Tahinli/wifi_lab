@@ -4,6 +4,9 @@
 //! serializes through `serde_json` lines. Signatures and field meanings are
 //! FIXED; implementations must conform exactly. Times are `last_seen_ms`
 //! (millis since the process-local epoch, see [`now_ms`]), RSSI in dBm.
+//! Fields added after the wire format froze carry serde defaults so older
+//! records deserialize losslessly (e.g. `ClientInfo.connected`, serde
+//! default true).
 
 use std::fmt;
 use std::time::Instant;
@@ -95,6 +98,32 @@ impl Security {
     }
 }
 
+/// Authentication key-management suites parsed from the RSN/WPA IE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Akm {
+    Psk,
+    Sae,
+    Owe,
+    FtPsk,
+    PskSha256,
+    OneX,
+    Other(u8),
+}
+
+impl Akm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Akm::Psk => "PSK",
+            Akm::Sae => "SAE",
+            Akm::Owe => "OWE",
+            Akm::FtPsk => "FT-PSK",
+            Akm::PskSha256 => "PSK-SHA256",
+            Akm::OneX => "802.1X",
+            Akm::Other(_) => "other",
+        }
+    }
+}
+
 /// A discovered access point. Live-updated by the scanner.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccessPoint {
@@ -107,6 +136,10 @@ pub struct AccessPoint {
     /// Millis since the process-local epoch ([`now_ms`]) of the last frame
     /// seen from this AP. Age display = `now_ms() - last_seen_ms`.
     pub last_seen_ms: u64,
+    /// AKM suites advertised in the RSN/WPA IE; empty = unknown (old peers,
+    /// non-RSN APs).
+    #[serde(default)]
+    pub akms: Vec<Akm>,
 }
 
 /// A discovered client station.
@@ -120,6 +153,25 @@ pub struct ClientInfo {
     /// Millis since the process-local epoch ([`now_ms`]) of the last frame
     /// seen from this station.
     pub last_seen_ms: u64,
+    /// Station liveness: true while the station is active/associated; the
+    /// scanner flips it false when it observes a deauth/disassoc affecting
+    /// the station, and any later frame from the station flips it back
+    /// true. Serde default is true so pre-field wire records deserialize
+    /// as connected.
+    #[serde(default = "crate::common::default_true")]
+    pub connected: bool,
+    /// MAC-randomization pairing: device-group id from the scanner
+    /// (`Event::ClientIdent`), when this MAC was correlated.
+    #[serde(default)]
+    pub ident_group: Option<u64>,
+    #[serde(default)]
+    pub ident_conf: Option<IdentConfidence>,
+}
+
+/// Serde `default` for fields whose absent wire value means `true`
+/// ([`ClientInfo::connected`]).
+pub fn default_true() -> bool {
+    true
 }
 
 /// A complete, crackable WPA 4-way handshake capture (M1+M2 minimum).
@@ -177,6 +229,56 @@ pub struct PmkidCapture {
     pub pmkid: [u8; 16],
 }
 
+/// Cumulative per-channel frame counters (scanner → UI snapshot).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelStat {
+    pub channel: u8,
+    pub frames: u64,
+    pub beacons: u64,
+}
+
+/// One observed probe request (client asking for a network).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProbeInfo {
+    pub client: MacAddr,
+    /// SSID of the probe; `None` for broadcast/wildcard probes.
+    pub ssid: Option<String>,
+    pub rssi_dbm: i8,
+    /// Millis since the process-local epoch ([`now_ms`]).
+    pub at_ms: u64,
+}
+
+/// Strength of a MAC-randomization pairing decision ([`Event::ClientIdent`]).
+/// Ordered weakest→strongest; UI displays it as `?`/`~`/`=` per `label()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum IdentConfidence {
+    /// Only the ordered-IE fingerprint matched — driver-class witness.
+    Probable,
+    /// Fingerprint match plus a per-frame witness: shared probed SSID or
+    /// uninterrupted 802.11 sequence numbers across the rotation.
+    Strong,
+    /// WPS UUID-E matched — the device identifies itself.
+    Exact,
+}
+
+impl IdentConfidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            IdentConfidence::Probable => "?",
+            IdentConfidence::Strong => "~",
+            IdentConfidence::Exact => "=",
+        }
+    }
+}
+
+/// Which of the two capture kinds was imported from a file (store::StoredCapture
+/// stays in store.rs; common must not depend on store).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ImportedCapture {
+    Handshake(Box<HandshakeCapture>),
+    Pmkid(PmkidCapture),
+}
+
 /// Events flowing from worker threads to the UI. In the real architecture
 /// the privileged service serializes them as `serde_json` lines on the
 /// child's stdout; in mock mode a thread pushes them onto a
@@ -186,6 +288,9 @@ pub enum Event {
     ApUpdated(AccessPoint),
     ApLost(MacAddr),
     ClientUpdated(ClientInfo),
+    /// Station silent past the scanner's client-expiry window — the UI
+    /// drops it from the clients table.
+    ClientLost(MacAddr),
     /// Progress while collecting 4-way messages.
     HandshakeProgress {
         ap: MacAddr,
@@ -197,16 +302,46 @@ pub enum Event {
     PmkidCaptured(PmkidCapture),
     /// Count of deauth/disassoc frames actually written to the wire.
     DeauthSent { ap: MacAddr, target: MacAddr, count: u64 },
-    /// Candidates checked so far (`done`) and current throughput (`hps`)
-    /// of a running crack job.
-    CrackProgress { done: u64, hps: f64 },
+    /// Candidates checked so far (`done`), current throughput (`hps`),
+    /// and the worst-case candidate total (`total`, when the attack
+    /// mode's space is countable) of a running crack job. Worst-case
+    /// remaining time = (total - done) / hps.
+    CrackProgress { done: u64, hps: f64, total: Option<u64> },
     /// A crack job recovered the passphrase.
     CrackFound { password: String },
     /// The active crack job ended: `found` distinguishes success from
     /// exhaustion/user-stop (emitted after [`Event::CrackFound`] too).
     CrackStopped { found: bool },
+    /// Throughput of a rainbow-table build job (PMKs written so far);
+    /// `total` is the wordlist's line count (worst-case table size).
+    RainbowProgress { done: u64, hps: f64, total: Option<u64> },
+    /// A rainbow-table build job ended (always exactly one; `entries` is
+    /// what actually landed in `path`, 0 on failure).
+    RainbowBuilt { path: String, entries: u64 },
     Log(String),
     Error(String),
+    /// Cumulative per-channel counters snapshot (emitted every ~2 s).
+    ChannelStats(Vec<ChannelStat>),
+    /// A novel probe request was observed.
+    ProbeObserved(ProbeInfo),
+    /// Deauth/disassoc storm detected on a (source, target) pair that we
+    /// did not cause — a foreign deauth attack in progress.
+    DeauthAlert {
+        source: MacAddr,
+        target: MacAddr,
+        count: u32,
+    },
+    /// A capture was imported from an external file (pcap / hc22000).
+    CaptureImported(ImportedCapture),
+    /// `mac` was correlated with a device group (MAC-randomization pairing):
+    /// every MAC witnessed on the same physical radio shares `group`.
+    ClientIdent {
+        mac: MacAddr,
+        group: u64,
+        confidence: IdentConfidence,
+    },
+    /// Crack-speed benchmark finished.
+    BenchmarkDone { gpu_hps: Option<f64>, cpu_hps: f64 },
 }
 
 /// Channel list for hopper: all enabled 2.4 GHz + 5 GHz UNII channels of the
@@ -256,15 +391,35 @@ pub enum Cmd {
         /// instead of hopping). `None`/empty = full hop list.
         #[serde(default)]
         channels: Option<Vec<u8>>,
+        /// Pcap spool file for the scan: every received raw frame (with
+        /// radiotap header) is appended to it. `None` = no spooling.
+        #[serde(default)]
+        spool: Option<std::path::PathBuf>,
+        /// Truncate the spool file on scan start (`false` = append if it
+        /// exists). UI sets `true` on a fresh scan from toggle_monitor,
+        /// `false` when re-parking channels mid-scan.
+        #[serde(default)]
+        fresh_spool: bool,
     },
     /// Stop the scanner, restore managed mode.
     StopScan,
-    /// Blast `count` deauth rounds at `target` (broadcast allowed) from
-    /// `ap`, after tuning to `channel`.
+    /// Blast `count` deauth rounds per `(bssid, channel)` entry at
+    /// `target` (broadcast allowed). Multiple entries cover dual-band
+    /// networks: the worker walks the list sequentially (one channel at a
+    /// time is all a single radio can do).
     Deauth {
-        ap: MacAddr,
+        aps: Vec<(MacAddr, u8)>,
         target: MacAddr,
+        count: u32,
+    },
+    /// Deauth every client of one AP at once: pins the channel, blasts
+    /// `count` rounds at each target in `targets`, then one broadcast
+    /// blast. `ap` is also recorded so the service's foreign-deauth
+    /// detector suppresses its own frames.
+    DeauthAll {
+        ap: MacAddr,
         channel: u8,
+        targets: Vec<MacAddr>,
         count: u32,
     },
     /// Clientless PMKID grab against `ap`.
@@ -273,10 +428,12 @@ pub enum Cmd {
         channel: u8,
         essid: String,
     },
-    /// Park on `ap`'s channel and track its 4-way handshakes.
+    /// Track 4-way handshakes of every BSSID in `targets` (dual-band
+    /// networks send the exchange on whichever band the client chose — the
+    /// parked SCANNER hops the union of channels, so a single listen
+    /// covers all bands). One channel → the worker pins it itself.
     CaptureHs {
-        ap: MacAddr,
-        channel: u8,
+        targets: Vec<(MacAddr, u8)>,
         essid: String,
     },
     /// Stop NetworkManager/wpa_supplicant so they stop pinning the radio.
@@ -298,6 +455,7 @@ mod tests {
             rssi_dbm: -42,
             beacons: 7,
             last_seen_ms: 123_456,
+            akms: vec![Akm::Psk],
         }
     }
 
@@ -308,6 +466,9 @@ mod tests {
             rssi_dbm: -55,
             frames: 3,
             last_seen_ms: 654_321,
+            connected: true,
+            ident_group: Some(7),
+            ident_conf: Some(IdentConfidence::Strong),
         }
     }
 
@@ -369,14 +530,41 @@ mod tests {
                 target: MacAddr::BROADCAST,
                 count: 64,
             },
-            Event::CrackProgress { done: 1000, hps: 1234.5 },
+            Event::CrackProgress { done: 1000, hps: 1234.5, total: Some(5000) },
             Event::CrackFound {
                 password: "hunter2".into(),
             },
             Event::CrackStopped { found: true },
             Event::CrackStopped { found: false },
+            Event::RainbowProgress { done: 42, hps: 9.5, total: None },
+            Event::RainbowBuilt {
+                path: "/tmp/t.pmk".into(),
+                entries: 7,
+            },
             Event::Log("hello".into()),
             Event::Error("boom".into()),
+            Event::ChannelStats(vec![
+                ChannelStat { channel: 6, frames: 1234, beacons: 56 },
+                ChannelStat { channel: 36, frames: 78, beacons: 9 },
+            ]),
+            Event::ProbeObserved(ProbeInfo {
+                client: MacAddr([0x42; 6]),
+                ssid: Some("HOME-WIFI".into()),
+                rssi_dbm: -61,
+                at_ms: 987_654,
+            }),
+            Event::DeauthAlert {
+                source: MacAddr([0xde; 6]),
+                target: MacAddr::BROADCAST,
+                count: 17,
+            },
+            Event::CaptureImported(ImportedCapture::Handshake(Box::new(handshake_obj()))),
+            Event::ClientIdent {
+                mac: MacAddr([0x02, 0xa0, 0xb1, 0xc2, 0xd3, 0xe4]),
+                group: 42,
+                confidence: IdentConfidence::Exact,
+            },
+            Event::BenchmarkDone { gpu_hps: Some(1_250_000.0), cpu_hps: 310_000.0 },
         ];
         for ev in &cases {
             let json = serde_json::to_string(ev).expect("serialize");
@@ -413,12 +601,13 @@ mod tests {
             Cmd::StartScan {
                 ifname: "wlp14s0".into(),
                 channels: None,
+                spool: None,
+                fresh_spool: false,
             },
             Cmd::StopScan,
             Cmd::Deauth {
-                ap: MacAddr([1; 6]),
+                aps: vec![(MacAddr([1; 6]), 6)],
                 target: MacAddr::BROADCAST,
-                channel: 6,
                 count: 16,
             },
             Cmd::Pmkid {
@@ -427,12 +616,17 @@ mod tests {
                 essid: "corp-wpa3".into(),
             },
             Cmd::CaptureHs {
-                ap: MacAddr([3; 6]),
-                channel: 11,
+                targets: vec![(MacAddr([3; 6]), 11), (MacAddr([4; 6]), 60)],
                 essid: "coffeeshop".into(),
             },
             Cmd::StopNetworkManager,
             Cmd::Shutdown,
+            Cmd::DeauthAll {
+                ap: MacAddr([5; 6]),
+                channel: 44,
+                targets: vec![MacAddr([6; 6]), MacAddr([7; 6])],
+                count: 8,
+            },
         ];
         for cmd in &cases {
             let json = serde_json::to_string(cmd).expect("serialize");

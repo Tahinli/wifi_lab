@@ -5,15 +5,15 @@
 //! captures may or may not include one — parsers simply ignore trailing
 //! bytes beyond what they need).
 
-use crate::common::{MacAddr, Security};
+use crate::common::{Akm, MacAddr, Security};
 
 /// LLC/SNAP header prefixing an EAPOL payload inside a data frame.
 const SNAP_EAPOL: [u8; 8] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e];
 
-const IE_SSID: u8 = 0;
+pub(crate) const IE_SSID: u8 = 0;
 const IE_DS_PARAM: u8 = 3;
 const IE_RSN: u8 = 48;
-const IE_VENDOR: u8 = 221;
+pub(crate) const IE_VENDOR: u8 = 221;
 
 /// Microsoft (WPA) vendor IE OUI+type prefix.
 const WPA_OUI: [u8; 4] = [0x00, 0x50, 0xf2, 0x01];
@@ -65,6 +65,40 @@ pub struct MgmtInfo {
     pub ssid: Option<String>, // None if hidden/zero-len
     pub channel: Option<u8>,  // DS parameter set IE
     pub security: Security,   // from RSN/WPA IEs + capability privacy bit
+    /// AKM suites from the RSN/WPA IE; empty for open/WEP or unparsed frames.
+    pub akms: Vec<Akm>,
+}
+
+/// Map an RSN AKM suite type byte to `Akm`.
+fn akm_from_type(t: u8) -> Akm {
+    match t {
+        2 => Akm::Psk,
+        8 => Akm::Sae,
+        18 => Akm::Owe,
+        4 => Akm::FtPsk,
+        6 => Akm::PskSha256,
+        1 => Akm::OneX,
+        other => Akm::Other(other),
+    }
+}
+
+/// Walk the AKM suite list of an RSN IE body, collecting mapped `Akm`s.
+/// Layout: version(2) group(4) pairwise_cnt(2) pairwise[4n] akm_cnt(2) akm[4m].
+fn rsn_akms(body: &[u8], out: &mut Vec<Akm>) {
+    let Some(pair_cnt) = u16le(body, 6).map(|c| c as usize) else {
+        return;
+    };
+    let mut o = 8usize + 4 * pair_cnt;
+    let Some(akm_cnt) = u16le(body, o).map(|c| c as usize) else {
+        return;
+    };
+    o += 2;
+    for i in 0..akm_cnt {
+        let Some(suite) = body.get(o + 4 * i..o + 4 * i + 4) else {
+            break;
+        };
+        out.push(akm_from_type(suite[3]));
+    }
 }
 
 /// True if the RSN IE body lists AKM suite 00:0f:ac:8 (SAE → WPA3).
@@ -109,6 +143,7 @@ pub fn parse_beacon_or_probe(f: &[u8]) -> Option<MgmtInfo> {
     let mut has_rsn = false;
     let mut has_sae = false;
     let mut has_wpa = false;
+    let mut akms = Vec::new();
     walk_ies(f, 36, |id, body| match id {
         IE_SSID => {
             if !body.is_empty() {
@@ -121,10 +156,13 @@ pub fn parse_beacon_or_probe(f: &[u8]) -> Option<MgmtInfo> {
         IE_RSN => {
             has_rsn = true;
             has_sae |= rsn_has_akm(body, 8);
+            rsn_akms(body, &mut akms);
         }
         IE_VENDOR => {
             if body.len() >= 4 && body[..4] == WPA_OUI {
                 has_wpa = true;
+                // WPA1 vendor IE: only PSK key management exists.
+                akms.push(Akm::Psk);
             }
         }
         _ => {}
@@ -140,12 +178,23 @@ pub fn parse_beacon_or_probe(f: &[u8]) -> Option<MgmtInfo> {
         Security::Open
     };
 
+    // An AP advertising WPA (vendor IE) AND WPA2 (RSN IE, e.g. mixed or
+    // transition mode) otherwise surfaces PSK twice. First-seen order wins.
+    let mut uniq: Vec<Akm> = Vec::with_capacity(akms.len());
+    for a in akms {
+        if !uniq.contains(&a) {
+            uniq.push(a);
+        }
+    }
+    let akms = uniq;
+
     Some(MgmtInfo {
         bssid: mac_at(f, 16)?,
         transmitter: mac_at(f, 10)?,
         ssid,
         channel,
         security,
+        akms,
     })
 }
 
@@ -167,6 +216,179 @@ pub fn parse_probe_req(f: &[u8]) -> Option<(MacAddr, Option<String>)> {
         return None;
     }
     Some((sta, ssid))
+}
+
+/// Association/reassociation request → (station, bssid, ssid).
+/// None for other/broken frames. SSID is None for hidden (`\0`-padded or
+/// empty) networks.
+pub fn parse_assoc_req(f: &[u8]) -> Option<(MacAddr, MacAddr, Option<String>)> {
+    let fc = u16le(f, 0)?;
+    let (ty, st) = type_subtype(fc);
+    // subtype 0 = assoc request, 1 = reassoc request; mgmt type only.
+    if ty != 0 || st > 1 {
+        return None;
+    }
+    let bssid = mac_at(f, 4)?; // addr1
+    let sta = mac_at(f, 10)?; // addr2
+    // Fixed params: capability(2) + listen interval(2) at offset 24, so IEs
+    // start at 28; reassoc adds current-AP MAC(6) → IEs start at 34.
+    let ie_off = if st == 0 { 28 } else { 34 };
+    let mut ssid = None;
+    walk_ies(f, ie_off, |id, body| {
+        if id == IE_SSID {
+            // hidden networks send a zero or NUL-padded SSID
+            let s: &[u8] = body;
+            let meaningful = s.iter().take_while(|&&b| b != 0).count();
+            if meaningful > 0 {
+                ssid = Some(String::from_utf8_lossy(&s[..meaningful]).into_owned());
+            }
+        }
+    });
+    // ensure the fixed params fit (frames shorter than ie_off are bogus)
+    if f.len() < ie_off {
+        return None;
+    }
+    Some((sta, bssid, ssid))
+}
+
+// ---------------------------------------------------------------------------
+// device correlation (pairing rotated/randomized MACs of one radio)
+// ---------------------------------------------------------------------------
+
+/// 12-bit per-transmitter sequence number (bytes 22-24, high nibble is the
+/// fragment number). A device's sequence counter survives MAC rotation, so
+/// near-continuity between two MACs' frames is a strong pairing witness.
+pub fn seq_of(f: &[u8]) -> Option<u16> {
+    Some(u16le(f, 22)? >> 4)
+}
+
+fn fnv_add(h: &mut u32, b: u8) {
+    *h ^= b as u32;
+    *h = h.wrapping_mul(0x0100_0193);
+}
+
+/// Ordered-IE device fingerprint (probe/assoc request frames): FNV-1a over
+/// the (tag, len) sequence, plus full payloads of the rate tags and the
+/// OUI+type tuple of vendor IEs. Stable per driver/firmware build and
+/// independent of the station's (possibly randomized) MAC and of which
+/// SSIDs it is probing. Different drivers of the same model usually share
+/// it, so it is a *probable* witness, not identity — pair it with UUID-E or
+/// sequence continuity for certainty.
+pub fn ie_fingerprint(f: &[u8], ie_off: usize) -> Option<u32> {
+    let mut h = 0x811c_9dc5u32;
+    let mut n = 0u32;
+    walk_ies(f, ie_off, |id, body| {
+        fnv_add(&mut h, id);
+        // SSID tag: content-agnostic. Directed and wildcard probes of the
+        // same radio alternate freely and differ only in this length; the
+        // probed-network signal comes from the group's SSID set instead.
+        if id != IE_SSID {
+            fnv_add(&mut h, body.len() as u8);
+        }
+        match id {
+            // rates + extended rates: full payload is model-specific
+            1 | 50 => body.iter().for_each(|&b| fnv_add(&mut h, b)),
+            // vendor IE: OUI+type+len, not the (device-varying) payload
+            IE_VENDOR if body.len() >= 4 => body[..4].iter().for_each(|&b| fnv_add(&mut h, b)),
+            _ => {}
+        }
+        n += 1;
+    });
+    (n > 0).then_some(h)
+}
+
+/// WPS UUID-E (attribute 0x1047) from a WPS vendor IE, if present. A stable
+/// per-device identifier leaked in probe requests by devices with WPS on —
+/// an exact pairing witness across MAC rotation.
+pub fn wps_uuid_e(f: &[u8], ie_off: usize) -> Option<[u8; 16]> {
+    // WPS vendor IE: OUI 00:50:f2, type 0x04; attributes are BE (id, len).
+    const WPS_OUI: [u8; 4] = [0x00, 0x50, 0xf2, 0x04];
+    const ATTR_UUID_E: u16 = 0x1047;
+    let mut out = None;
+    walk_ies(f, ie_off, |id, body| {
+        if id != IE_VENDOR || body.len() < 4 || body[..4] != WPS_OUI {
+            return;
+        }
+        let mut cur = 4;
+        while cur + 4 <= body.len() {
+            let attr = u16::from_be_bytes([body[cur], body[cur + 1]]);
+            let len = u16::from_be_bytes([body[cur + 2], body[cur + 3]]) as usize;
+            let Some(val) = body.get(cur + 4..cur + 4 + len) else {
+                break;
+            };
+            if attr == ATTR_UUID_E && len == 16 {
+                out = Some(val.try_into().expect("len checked"));
+            }
+            cur += 4 + len;
+        }
+    });
+    out
+}
+
+/// Device-correlation material parsed from a probe request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeIdent {
+    pub sta: MacAddr,
+    pub ssid: Option<String>,     // None for the wildcard probe
+    pub fingerprint: u32,
+    pub uuid: Option<[u8; 16]>,
+}
+
+/// Same, from an association/reassociation request (adds the target bssid).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssocIdent {
+    pub sta: MacAddr,
+    pub bssid: MacAddr,
+    pub ssid: Option<String>,
+    pub fingerprint: u32,
+    pub uuid: Option<[u8; 16]>,
+}
+
+/// Probe request with device-correlation material; None for other frames or
+/// probes with an empty/malformed IE chain (fingerprint impossible).
+pub fn parse_probe_ident(f: &[u8]) -> Option<ProbeIdent> {
+    let fc = u16le(f, 0)?;
+    if type_subtype(fc) != (0, 4) {
+        return None;
+    }
+    let sta = mac_at(f, 10)?;
+    let fingerprint = ie_fingerprint(f, 24)?;
+    let mut ssid = None;
+    walk_ies(f, 24, |id, body| {
+        if id == IE_SSID && !body.is_empty() {
+            ssid = Some(String::from_utf8_lossy(body).into_owned());
+        }
+    });
+    let uuid = wps_uuid_e(f, 24);
+    Some(ProbeIdent { sta, ssid, fingerprint, uuid })
+}
+
+/// Assoc/reassoc request with device-correlation material; None for other
+/// frames. SSID is None for hidden (empty/NUL-padded) networks.
+pub fn parse_assoc_ident(f: &[u8]) -> Option<AssocIdent> {
+    let fc = u16le(f, 0)?;
+    let (ty, st) = type_subtype(fc);
+    if ty != 0 || st > 1 {
+        return None;
+    }
+    let ie_off = if st == 0 { 28 } else { 34 };
+    if f.len() < ie_off {
+        return None;
+    }
+    let bssid = mac_at(f, 4)?;
+    let sta = mac_at(f, 10)?;
+    let fingerprint = ie_fingerprint(f, ie_off)?;
+    let mut ssid = None;
+    walk_ies(f, ie_off, |id, body| {
+        if id == IE_SSID {
+            let meaningful = body.iter().take_while(|&&b| b != 0).count();
+            if meaningful > 0 {
+                ssid = Some(String::from_utf8_lossy(&body[..meaningful]).into_owned());
+            }
+        }
+    });
+    let uuid = wps_uuid_e(f, ie_off);
+    Some(AssocIdent { sta, bssid, ssid, fingerprint, uuid })
 }
 
 /// Parse deauth/disassoc → (from-ap MacAddr as transmitter, target addr1).
@@ -333,6 +555,19 @@ pub fn build_disassoc(ap: &MacAddr, target: &MacAddr, reason: u16) -> Vec<u8> {
     v
 }
 
+/// Probe request sta → broadcast: empty `ssid` = wildcard (every AP on
+/// the channel should answer with a probe response), otherwise directed.
+/// Used by the injection canary: a response proves injected frames
+/// actually radiate.
+pub fn build_probe_req(ssid: &[u8], sa: &MacAddr) -> Vec<u8> {
+    let mut v = hdr3(0x40, &MacAddr::BROADCAST, sa, &MacAddr::BROADCAST, 0);
+    v.push(IE_SSID);
+    v.push(ssid.len().min(32) as u8);
+    v.extend_from_slice(&ssid[..ssid.len().min(32)]);
+    v.extend_from_slice(&[0x01, 0x04, 0x82, 0x84, 0x8b, 0x96]); // supported rates
+    v
+}
+
 /// Open-system authentication request sta → ap (algo 0, transaction 1).
 pub fn build_auth_open(ap: &MacAddr, sta: &MacAddr, seq: u16) -> Vec<u8> {
     let mut v = hdr3(0xB0, ap, sta, ap, seq);
@@ -412,6 +647,219 @@ mod tests {
         assert_eq!(info.ssid.as_deref(), Some("parafin"));
         assert_eq!(info.channel, Some(6));
         assert_eq!(info.security, Security::Wpa2);
+    }
+
+    /// RSN IE with several AKM suites listed in order.
+    fn rsn_ie_multi(akm_types: &[u8]) -> Vec<u8> {
+        let mut b = vec![
+            0x01, 0x00, // version
+            0x00, 0x0f, 0xac, 0x04, // group cipher CCMP
+            0x01, 0x00, // pairwise count
+            0x00, 0x0f, 0xac, 0x04, // pairwise CCMP
+        ];
+        b.extend_from_slice(&(akm_types.len() as u16).to_le_bytes());
+        for &t in akm_types {
+            b.extend_from_slice(&[0x00, 0x0f, 0xac, t]);
+        }
+        b.extend_from_slice(&[0x00, 0x00]); // rsn capabilities
+        let b = b.split_off(0);
+        ie(IE_RSN, &b)
+    }
+
+    /// Beacon like `parafin_beacon` but with the RSN IE replaced by `rsn`.
+    fn beacon_with_rsn(rsn: Vec<u8>) -> Vec<u8> {
+        let mut v = parafin_beacon();
+        v.splice(v.len() - rsn_ie(2).len().., rsn);
+        v
+    }
+
+    #[test]
+    fn akm_list_parsed() {
+        // WPA2/WPA3 transition: PSK + SAE both advertised.
+        let f = beacon_with_rsn(rsn_ie_multi(&[2, 8]));
+        let info = parse_beacon_or_probe(&f).expect("beacon parses");
+        assert_eq!(info.akms, vec![Akm::Psk, Akm::Sae]);
+        // security label logic untouched: SAE present → Wpa3
+        assert_eq!(info.security, Security::Wpa3);
+
+        // OWE (type 18)
+        let f = beacon_with_rsn(rsn_ie_multi(&[18]));
+        let info = parse_beacon_or_probe(&f).unwrap();
+        assert_eq!(info.akms, vec![Akm::Owe]);
+        // no SAE → Wpa2 label
+        assert_eq!(info.security, Security::Wpa2);
+
+        // unknown suite type → Other, PSK still mapped
+        let f = beacon_with_rsn(rsn_ie_multi(&[2, 99]));
+        let info = parse_beacon_or_probe(&f).unwrap();
+        assert_eq!(info.akms, vec![Akm::Psk, Akm::Other(99)]);
+
+        // plain WPA2-PSK beacon: single PSK entry
+        let info = parse_beacon_or_probe(&parafin_beacon()).unwrap();
+        assert_eq!(info.akms, vec![Akm::Psk]);
+
+        // open network: no security IEs → empty akms
+        let mut f = parafin_beacon();
+        f.truncate(36);
+        f.extend_from_slice(&ie(IE_SSID, b"cafe"));
+        f[34] = 0x01; // clear privacy bit
+        f[35] = 0x04;
+        let info = parse_beacon_or_probe(&f).unwrap();
+        assert_eq!(info.security, Security::Open);
+        assert_eq!(info.akms, Vec::<Akm>::new());
+    }
+
+    #[test]
+    fn wpa1_vendor_ie_yields_psk_akm() {
+        let mut f = parafin_beacon();
+        f.truncate(36);
+        f.extend_from_slice(&ie(IE_SSID, b"legacy"));
+        // WPA_OUI vendor IE: oui+type, then version(2) — content beyond the
+        // OUI is not inspected, so the minimal fixture suffices.
+        f.extend_from_slice(&ie(IE_VENDOR, &[0x00, 0x50, 0xf2, 0x01, 0x01, 0x00]));
+        let info = parse_beacon_or_probe(&f).unwrap();
+        assert_eq!(info.security, Security::Wpa);
+        assert_eq!(info.akms, vec![Akm::Psk]);
+    }
+
+    #[test]
+    fn akms_deduped_across_wpa_and_rsn_ies() {
+        // Mixed WPA/WPA2 AP: RSN IE with PSK plus the WPA vendor IE — the
+        // vendor arm must not surface a duplicate PSK.
+        let mut f = beacon_with_rsn(rsn_ie_multi(&[2]));
+        f.extend_from_slice(&ie(IE_VENDOR, &[0x00, 0x50, 0xf2, 0x01, 0x01, 0x00]));
+        let info = parse_beacon_or_probe(&f).unwrap();
+        assert_eq!(info.akms, vec![Akm::Psk], "no PSK+PSK duplication");
+    }
+
+    #[test]
+    fn seq_number_extracted() {
+        let mut f = parafin_beacon();
+        // seq field at bytes 22-24: seq<<4 | frag
+        f[22] = 0x30; // seq 3, frag 0
+        f[23] = 0x02; // → 0x230 >> 4 = 0x23 = 35
+        assert_eq!(seq_of(&f), Some(0x23));
+        assert_eq!(seq_of(&f[..20]), None);
+    }
+
+    /// Probe builder mirroring the scanner tests' shape.
+    fn probe_with(sta: &MacAddr, ssid: Option<&str>, ies: &[Vec<u8>], seq: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0040u16.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&MacAddr::BROADCAST.0);
+        v.extend_from_slice(&sta.0);
+        v.extend_from_slice(&MacAddr::BROADCAST.0);
+        v.extend_from_slice(&(seq << 4).to_le_bytes());
+        match ssid {
+            Some(s) => v.extend_from_slice(&ie(IE_SSID, s.as_bytes())),
+            None => v.extend_from_slice(&ie(IE_SSID, b"")),
+        }
+        for b in ies {
+            v.extend_from_slice(b);
+        }
+        v
+    }
+
+    #[test]
+    fn fingerprint_stable_directed_vs_wildcard() {
+        // The same radio alternating directed/wildcard probes must hash
+        // identically; a different IE chain must not.
+        let rates = ie(1, &[0x82, 0x84, 0x8b, 0x96]);
+        let f1 = probe_with(&STA, Some("parafin"), &[rates.clone()], 7);
+        let f2 = probe_with(&STA, None, &[rates.clone()], 8);
+        let i1 = parse_probe_ident(&f1).expect("parses");
+        let i2 = parse_probe_ident(&f2).expect("parses");
+        assert_eq!(i1.fingerprint, i2.fingerprint);
+        assert_eq!(i1.ssid.as_deref(), Some("parafin"));
+        assert_eq!(i2.ssid, None);
+
+        let other = probe_with(&STA, None, &[ie(1, &[0x82, 0x84])], 9);
+        let i3 = parse_probe_ident(&other).expect("parses");
+        assert_ne!(i1.fingerprint, i3.fingerprint);
+
+        // Off a probe frame entirely → None.
+        assert!(parse_probe_ident(&parafin_beacon()).is_none());
+    }
+
+    #[test]
+    fn wps_uuid_e_parsed_from_probe() {
+        let uuid = [0xabu8; 16];
+        let mut wps_body = vec![0x00, 0x50, 0xf2, 0x04];
+        wps_body.extend_from_slice(&0x1047u16.to_be_bytes());
+        wps_body.extend_from_slice(&16u16.to_be_bytes());
+        wps_body.extend_from_slice(&uuid);
+        let wps = ie(IE_VENDOR, &wps_body);
+        let f = probe_with(&STA, None, &[wps], 7);
+        let ident = parse_probe_ident(&f).expect("parses");
+        assert_eq!(ident.uuid, Some(uuid));
+        // Truncated attribute body → no uuid, no panic.
+        let short = ie(IE_VENDOR, &[0x00, 0x50, 0xf2, 0x04, 0x10, 0x47, 0x00, 0x10, 0xaa, 0xbb]);
+        let f = probe_with(&STA, None, &[short], 7);
+        assert_eq!(parse_probe_ident(&f).unwrap().uuid, None);
+    }
+
+    #[test]
+    fn assoc_ident_parsed() {
+        let f = build_assoc_req(&AP, &STA, b"testap");
+        let ident = parse_assoc_ident(&f).expect("assoc ident parses");
+        assert_eq!(ident.sta, STA);
+        assert_eq!(ident.bssid, AP);
+        assert_eq!(ident.ssid.as_deref(), Some("testap"));
+        assert_eq!(ident.uuid, None);
+        assert!(parse_assoc_ident(&parafin_beacon()).is_none());
+        for cut in 0..f.len() {
+            let _ = parse_assoc_ident(&f[..cut]);
+        }
+    }
+
+    #[test]
+    fn assoc_req_parsed() {
+        // assoc request: addr1=bssid(AP), addr2=sta, ssid "testap"
+        let f = build_assoc_req(&AP, &STA, b"testap");
+        let (sta, bssid, ssid) = parse_assoc_req(&f).expect("assoc-req parses");
+        assert_eq!(sta, STA);
+        assert_eq!(bssid, AP);
+        assert_eq!(ssid.as_deref(), Some("testap"));
+
+        // reassoc request (subtype 1): extra current-AP field before IEs
+        let mut r = hdr3(0x10, &AP, &STA, &AP, 0);
+        r.extend_from_slice(&0x0431u16.to_le_bytes()); // capability
+        r.extend_from_slice(&10u16.to_le_bytes()); // listen interval
+        r.extend_from_slice(&STA.0); // current AP (assoc) — arbitrary MAC here
+        r.extend_from_slice(&ie(IE_SSID, b"home-net"));
+        let (sta, bssid, ssid) = parse_assoc_req(&r).expect("reassoc-req parses");
+        assert_eq!(sta, STA);
+        assert_eq!(bssid, AP);
+        assert_eq!(ssid.as_deref(), Some("home-net"));
+
+        // empty SSID → None (hidden/wildcard attempt)
+        let mut g = hdr3(0x00, &AP, &STA, &AP, 0);
+        g.extend_from_slice(&0x0431u16.to_le_bytes());
+        g.extend_from_slice(&10u16.to_le_bytes());
+        g.extend_from_slice(&ie(IE_SSID, b""));
+        let (_, _, ssid) = parse_assoc_req(&g).unwrap();
+        assert_eq!(ssid, None);
+
+        // NUL-padded SSID → None
+        let mut h = hdr3(0x00, &AP, &STA, &AP, 0);
+        h.extend_from_slice(&0x0431u16.to_le_bytes());
+        h.extend_from_slice(&10u16.to_le_bytes());
+        h.extend_from_slice(&ie(IE_SSID, &[0x00, 0x00, 0x00]));
+        let (_, _, ssid) = parse_assoc_req(&h).unwrap();
+        assert_eq!(ssid, None);
+
+        // truncated frames: header cut anywhere → None or no panic
+        for cut in 0..f.len() {
+            let _ = parse_assoc_req(&f[..cut]);
+        }
+        // frame too short to hold the fixed params → None
+        assert_eq!(parse_assoc_req(&f[..24]), None);
+
+        // non-assoc frames rejected
+        assert_eq!(parse_assoc_req(&parafin_beacon()), None);
+        let pr = build_probe_req(b"x", &STA);
+        assert_eq!(parse_assoc_req(&pr), None);
     }
 
     #[test]
@@ -497,6 +945,18 @@ mod tests {
         let mut f = hdr3(0x40, &MacAddr::BROADCAST, &STA, &MacAddr::BROADCAST, 0);
         f.extend_from_slice(&ie(IE_SSID, b"parafin"));
         let (sta, ssid) = parse_probe_req(&f).unwrap();
+        assert_eq!(sta, STA);
+        assert_eq!(ssid.as_deref(), Some("parafin"));
+    }
+
+    #[test]
+    fn build_probe_req_roundtrips_wildcard_and_directed() {
+        let wild = build_probe_req(&[], &STA);
+        let (sta, ssid) = parse_probe_req(&wild).unwrap();
+        assert_eq!(sta, STA);
+        assert_eq!(ssid, None, "wildcard SSID (len 0) parses as None");
+        let dir = build_probe_req(b"parafin", &STA);
+        let (sta, ssid) = parse_probe_req(&dir).unwrap();
         assert_eq!(sta, STA);
         assert_eq!(ssid.as_deref(), Some("parafin"));
 
