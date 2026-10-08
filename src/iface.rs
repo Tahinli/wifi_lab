@@ -5,6 +5,8 @@
 //! concern (this module intentionally does NOT kill daemons like airmon-ng).
 
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -32,6 +34,70 @@ fn ip(args: &[&str]) -> Result<String> {
 fn iw(args: &[&str]) -> Result<String> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     run("iw", &args)
+}
+
+/// RF-channel arbitration shared by the hopping scanner and the attack
+/// workers. The scanner consults [`ChannelPin::get`] once per hop cycle:
+/// nonzero → dwell on that frequency; zero → normal hop. Attack workers
+/// move the pin instead of fighting the hopper with their own `set_freq`
+/// calls (the scanner re-asserts the pinned value, not the hop plan).
+///
+/// Two layers: `owner` is the long-lived holder's desired MHz (the
+/// handshake-capture worker — it must get the channel BACK after a short
+/// interruption), `active` is what the scanner currently must dwell on.
+/// A deauth worker briefly [`override_freq`](ChannelPin::override_freq)s
+/// `active` per band, then [`settle`](ChannelPin::settle)s to restore the
+/// owner's frequency (or free hop when nothing is held).
+pub struct ChannelPin {
+    active: AtomicU16,
+    owner: Mutex<Option<u16>>,
+}
+
+impl ChannelPin {
+    /// Long-lived hold: become the owner and pin the radio to `mhz`.
+    pub fn hold(&self, mhz: u16) {
+        *self.owner.lock().expect("pin owner poisoned") = Some(mhz);
+        self.active.store(mhz, Ordering::Release);
+    }
+
+    /// Release a hold — only by its owner (`owner == Some(mhz)`); a
+    /// foreign release is ignored so a stale worker can't un-pin a newer
+    /// capture. On release the scanner returns to free hopping.
+    pub fn release(&self, mhz: u16) {
+        let mut owner = self.owner.lock().expect("pin owner poisoned");
+        if *owner == Some(mhz) {
+            *owner = None;
+            self.active.store(0, Ordering::Release);
+        }
+    }
+
+    /// Short-lived override (deauth per-band): move the radio now WITHOUT
+    /// touching ownership — a later [`settle`](ChannelPin::settle) hands
+    /// the channel back to the owner.
+    pub fn override_freq(&self, mhz: u16) {
+        self.active.store(mhz, Ordering::Release);
+    }
+
+    /// Deauth finished: restore the owner's frequency, or free hop (0)
+    /// when nothing is held.
+    pub fn settle(&self) {
+        let owner = *self.owner.lock().expect("pin owner poisoned");
+        self.active.store(owner.unwrap_or(0), Ordering::Release);
+    }
+
+    /// MHz the scanner must dwell on; 0 = free hopping.
+    pub fn get(&self) -> u16 {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ChannelPin {
+    fn default() -> Self {
+        ChannelPin {
+            active: AtomicU16::new(0),
+            owner: Mutex::new(None),
+        }
+    }
 }
 
 /// True when `ifname` shows up as a netdev in `iw dev` output.
@@ -73,6 +139,55 @@ pub fn to_monitor(ifname: &str) -> Result<String> {
     }
     ip(&["link", "set", &mon, "up"])?;
     Ok(mon)
+}
+
+/// Unload + reload the kernel driver bound to `ifname`'s device, then wait
+/// for the interface to re-enumerate and force it back DOWN (the managed
+/// vif is recreated by the driver; NetworkManager may grab it otherwise).
+/// Last-resort recovery for the mt76/mt7921e monitor-TX wedge: injected
+/// frames report send() success but never radiate (verified on lab MT7922:
+/// 12 wildcard probes → 0 probe responses; after `modprobe -r mt7921e` +
+/// reload → 7 responses). RX is unaffected by the wedge, so scans look
+/// healthy while deauth/PMKID silently do nothing — the only cure found is
+/// a driver reload. ALL vifs (managed + monitor) on the phy die with the
+/// unload; callers must recreate the monitor vif afterwards.
+pub fn reset_driver(ifname: &str) -> Result<()> {
+    let uevent = std::fs::read_to_string(format!("/sys/class/net/{ifname}/device/uevent"))
+        .with_context(|| format!("reading device uevent for {ifname}"))?;
+    let driver = uevent
+        .lines()
+        .find_map(|l| l.strip_prefix("DRIVER="))
+        .context("no DRIVER= in device uevent — not a PCI/USB driver?)")?;
+    let run_modprobe = |args: &[&str]| {
+        Command::new("modprobe")
+            .args(args)
+            .output()
+            .with_context(|| format!("running modprobe {args:?}"))
+            .and_then(|o| {
+                if o.status.success() {
+                    Ok(())
+                } else {
+                    bail!("modprobe {args:?}: {}", String::from_utf8_lossy(&o.stderr))
+                }
+            })
+    };
+    run_modprobe(&["-r", driver])
+        .with_context(|| format!("unloading {driver} (injection-wedge recovery)"))?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    run_modprobe(&[driver]).with_context(|| format!("reloading {driver}"))?;
+    // Re-enumeration (firmware load etc.) takes a moment.
+    for _ in 0..50 {
+        if std::path::Path::new(&format!("/sys/class/net/{ifname}")).exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !std::path::Path::new(&format!("/sys/class/net/{ifname}")).exists() {
+        bail!("{ifname} did not re-enumerate within 5 s of reloading {driver}");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    ip(&["link", "set", ifname, "down"])?;
+    Ok(())
 }
 
 /// Reverse [`to_monitor`]: delete the monitor vif if present and bring the
@@ -204,13 +319,31 @@ pub fn networkmanager_active() -> bool {
 }
 
 /// Stop NetworkManager (and with it wpa_supplicant's radio fighting).
-/// Requires root. Restart later with `systemctl start NetworkManager`.
+/// Requires root. Restart later with [`start_networkmanager`]
+/// (`systemctl start NetworkManager`).
 pub fn stop_networkmanager() -> Result<()> {
     run(
         "systemctl",
         &["stop".into(), "NetworkManager".into()],
     )
     .map(|_| ())
+}
+
+/// Start NetworkManager again (mirrors [`stop_networkmanager`]), restoring
+/// normal managed-mode connectivity once capture work is done. Requires root.
+pub fn start_networkmanager() -> Result<()> {
+    run(
+        "systemctl",
+        &["start".into(), "NetworkManager".into()],
+    )
+    .map(|_| ())
+}
+
+/// True when the monitor vif `<ifname>mon` no longer exists — the post-scan
+/// restore check wants this so we can warn the user if the interface was
+/// left in monitor mode.
+pub fn monitor_gone(ifname: &str) -> bool {
+    !iface_exists(&monitor_name(ifname))
 }
 
 /// True when `pkexec` (polkit) is available to elevate the privileged
@@ -260,5 +393,65 @@ mod tests {
     #[test]
     fn current_channel_of_missing_iface_errors_not_panics() {
         assert!(current_channel("definitely-not-an-iface-xyz").is_err());
+    }
+
+    #[test]
+    fn pin_defaults_to_free_hop() {
+        let pin = ChannelPin::default();
+        assert_eq!(pin.get(), 0);
+    }
+
+    #[test]
+    fn pin_hold_pins_and_release_frees() {
+        let pin = ChannelPin::default();
+        pin.hold(2437);
+        assert_eq!(pin.get(), 2437);
+        pin.release(2437);
+        assert_eq!(pin.get(), 0);
+    }
+
+    #[test]
+    fn pin_foreign_release_is_ignored() {
+        let pin = ChannelPin::default();
+        pin.hold(2437);
+        // A stale worker releasing a DIFFERENT frequency must not un-pin.
+        pin.release(5180);
+        assert_eq!(pin.get(), 2437);
+        pin.release(2437);
+        assert_eq!(pin.get(), 0);
+    }
+
+    #[test]
+    fn pin_override_moves_active_but_settle_restores_owner() {
+        let pin = ChannelPin::default();
+        pin.hold(2437);
+        // Deauth worker briefly de-tunes to another band, then settles.
+        pin.override_freq(5180);
+        assert_eq!(pin.get(), 5180);
+        pin.settle();
+        assert_eq!(pin.get(), 2437, "settle must hand the channel back to the owner");
+        pin.release(2437);
+        assert_eq!(pin.get(), 0);
+    }
+
+    #[test]
+    fn pin_settle_without_owner_frees() {
+        let pin = ChannelPin::default();
+        pin.override_freq(5180);
+        pin.settle();
+        assert_eq!(pin.get(), 0);
+    }
+
+    #[test]
+    fn pin_rehold_replaces_owner() {
+        let pin = ChannelPin::default();
+        pin.hold(2437);
+        pin.hold(5865);
+        assert_eq!(pin.get(), 5865);
+        // The old owner's release is now foreign; the new one sticks.
+        pin.release(2437);
+        assert_eq!(pin.get(), 5865);
+        pin.release(5865);
+        assert_eq!(pin.get(), 0);
     }
 }
