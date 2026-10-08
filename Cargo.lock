@@ -6883,6 +6883,7 @@ dependencies = [
  "gpuikit",
  "hmac 0.12.1",
  "libc",
+ "notify-rust",
  "pbkdf2 0.13.0",
  "pollster 0.4.0",
  "serde",
