@@ -4,6 +4,7 @@
 //! target only gets the AP-side broadcasted deauth — there is no sane
 //! reverse direction for the broadcast address.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -58,6 +59,8 @@ fn frame_plan(ap: &MacAddr, target: &MacAddr) -> Vec<Vec<u8>> {
 /// a [`Event::DeauthSent`] progress event every 32 sent frames.
 ///
 /// Retries briefly on EAGAIN (driver TX ring full); any other error aborts.
+/// `stop` is checked per round: when set, the blast breaks cleanly — a
+/// long blast must not block the service command loop on scan restart.
 /// Returns frames actually written to the wire.
 pub fn blast(
     sock: &RawSocket,
@@ -65,12 +68,16 @@ pub fn blast(
     target: &MacAddr,
     count: u32,
     tx: &Sender<Event>,
+    stop: &AtomicBool,
 ) -> Result<u64> {
     let frames = frame_plan(ap, target);
     let mut sent: u64 = 0;
     let mut last_report: u64 = 0;
 
-    for round in 0..count {
+    for _ in 0..count {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         for f in &frames {
             // EAGAIN-aware send: bounded backoff (~5 × 2 ms), then give up.
             let mut attempt = 0;
@@ -101,7 +108,6 @@ pub fn blast(
             }
             sleep(PACE);
         }
-        let _ = round;
     }
 
     // Final report so the UI sees the exact total even under REPORT_EVERY.
