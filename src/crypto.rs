@@ -69,18 +69,16 @@ pub fn pmk(pass: &[u8], ssid: &[u8]) -> [u8; 32] {
     out
 }
 
-/// PTK derivation per 802.11-2016 §12.7.1.2 (PRF-512):
-/// HMAC-SHA1(pmk, "Pairwise key expansion" || 0x00 || A || B || i) for i in 1..,
-/// with A = min(ap,sta)||max(ap,sta), B = min(anonce,snonce)||max(anonce,snonce).
-pub fn ptk(
-    pmk: &[u8; 32],
+/// PRF message stem ("Pairwise key expansion" || 0x00 || A || B, 99
+/// bytes): A = min(ap,sta)||max(ap,sta), B = min(anonce,snonce)||
+/// max(anonce,snonce). Shared by [`ptk`] and the GPU kernel's per-target
+/// KCK message (which appends counter byte 0x01).
+pub(crate) fn prf_stem(
     ap: &MacAddr,
     sta: &MacAddr,
     anonce: &[u8; 32],
     snonce: &[u8; 32],
-) -> [u8; 64] {
-    use hmac::{Hmac, Mac};
-
+) -> Vec<u8> {
     let mut a_pair = [0u8; 12];
     if ap.0 <= sta.0 {
         a_pair[..6].copy_from_slice(&ap.0);
@@ -98,12 +96,27 @@ pub fn ptk(
         b_pair[32..].copy_from_slice(anonce);
     }
 
-    // "Pairwise key expansion" || 0x00 || A || B || i
-    let mut msg = Vec::with_capacity(22 + 1 + 12 + 64 + 1);
+    let mut msg = Vec::with_capacity(22 + 1 + 12 + 64);
     msg.extend_from_slice(b"Pairwise key expansion");
     msg.push(0u8);
     msg.extend_from_slice(&a_pair);
     msg.extend_from_slice(&b_pair);
+    msg
+}
+
+/// PTK derivation per 802.11-2016 §12.7.1.2 (PRF-512):
+/// HMAC-SHA1(pmk, "Pairwise key expansion" || 0x00 || A || B || i) for i in 1..,
+/// with A = min(ap,sta)||max(ap,sta), B = min(anonce,snonce)||max(anonce,snonce).
+pub fn ptk(
+    pmk: &[u8; 32],
+    ap: &MacAddr,
+    sta: &MacAddr,
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+) -> [u8; 64] {
+    use hmac::{Hmac, Mac};
+
+    let mut msg = prf_stem(ap, sta, anonce, snonce);
     let stem_len = msg.len();
     msg.push(0u8); // PRF counter byte, rewritten per round below
 
@@ -119,19 +132,24 @@ pub fn ptk(
     out
 }
 
-/// EAPOL-Key MIC. Zeroes bytes 81..97 of a copy of `eapol` (the MIC field
-/// offset in a well-formed EAPOL-Key frame; short frames are left untouched),
-/// then: key_ver 1|2 → HMAC-SHA1 keyed with KCK and truncated to 16 bytes,
-/// key_ver 3 → AES-128-CMAC over IGTK||0^64||frame.
-pub fn mic(ptk: &[u8; 64], eapol: &[u8], key_ver: u8) -> [u8; 16] {
-    use hmac::{Hmac, Mac};
-
+/// EAPOL frame with its MIC field zeroed (bytes 81..97; short frames stay
+/// untouched). The zeroed frame is CONSTANT across all candidates of one
+/// capture — crack loops compute it once and call [`mic_on_zeroed`] per
+/// candidate instead of re-copying the frame every time.
+pub fn zeroed_eapol(eapol: &[u8]) -> Vec<u8> {
     let mut data = eapol.to_vec();
     const MIC_OFF: usize = 81;
     const MIC_LEN: usize = 16;
     if data.len() >= MIC_OFF + MIC_LEN {
         data[MIC_OFF..MIC_OFF + MIC_LEN].fill(0);
     }
+    data
+}
+
+/// MIC over an already-MIC-zeroed frame (see [`zeroed_eapol`]). No
+/// allocation — the hot path of the cracker's per-candidate check.
+pub fn mic_on_zeroed(ptk: &[u8; 64], zeroed: &[u8], key_ver: u8) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
 
     if key_ver == 3 {
         // key_mic_len = 16 → blk_key = IGTK||0x00*8. EAPOL frames are never
@@ -139,16 +157,24 @@ pub fn mic(ptk: &[u8; 64], eapol: &[u8], key_ver: u8) -> [u8; 16] {
         // len ≡ 0 mod 16 correctly either way.
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&ptk[48..56]);
-        cmac_aes128(&key, &data)
+        cmac_aes128(&key, zeroed)
     } else {
         let mut mac =
             <Hmac<sha1::Sha1> as Mac>::new_from_slice(&ptk[..16]).expect("KCK is 16 bytes");
-        mac.update(&data);
+        mac.update(zeroed);
         let digest = mac.finalize().into_bytes();
         let mut out = [0u8; 16];
         out.copy_from_slice(&digest[..16]);
         out
     }
+}
+
+/// EAPOL-Key MIC. Zeroes bytes 81..97 of a copy of `eapol` (the MIC field
+/// offset in a well-formed EAPOL-Key frame; short frames are left untouched),
+/// then: key_ver 1|2 → HMAC-SHA1 keyed with KCK and truncated to 16 bytes,
+/// key_ver 3 → AES-128-CMAC over IGTK||0^64||frame.
+pub fn mic(ptk: &[u8; 64], eapol: &[u8], key_ver: u8) -> [u8; 16] {
+    mic_on_zeroed(ptk, &zeroed_eapol(eapol), key_ver)
 }
 
 /// PMKID = HMAC-SHA1-128(pmk, "PMK Name" || ap || sta).

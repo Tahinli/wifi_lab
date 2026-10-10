@@ -252,20 +252,33 @@ pub const CAPTURE_POLL_MS: u32 = 250;
 /// untouched.
 pub fn capture_loop(
     sock: &RawSocket,
-    ap: MacAddr,
+    targets: &[MacAddr],
     essid: &str,
     tx: &Sender<Event>,
     stop: &Arc<AtomicBool>,
 ) -> Result<bool> {
     sock.set_timeout(CAPTURE_POLL_MS)?;
     let _ = tx.send(Event::Log(format!(
-        "handshake: listening for 4-way on {ap} ({essid})"
+        "handshake: listening for 4-way on {} ({essid})",
+        if targets.len() == 1 {
+            targets[0].to_string()
+        } else {
+            format!("{} bssids", targets.len())
+        }
     )));
 
     let mut tracker = Tracker::new();
     let mut buf = vec![0u8; 4096];
     // ~4 minutes of dead air without a single EAPOL message → give up.
-    let idle_deadline = Instant::now() + Duration::from_secs(240);
+    let mut idle_deadline = Instant::now() + Duration::from_secs(240);
+
+    // Diagnostics: a silent capture must be distinguishable from deaf radio
+    // (0 frames) vs wrong AP (EAPOL on other BSSIDs) vs client simply not
+    // reassociating (EAPOL on target but no 4-way yet) → periodic stats.
+    let mut frames: u64 = 0;
+    let mut eapol_other: u64 = 0;
+    let mut last_stats = Instant::now();
+    const STATS_EVERY: Duration = Duration::from_secs(30);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -273,6 +286,12 @@ pub fn capture_loop(
         }
         if Instant::now() >= idle_deadline {
             return Ok(false);
+        }
+        if last_stats.elapsed() >= STATS_EVERY {
+            last_stats = Instant::now();
+            let _ = tx.send(Event::Log(format!(
+                "handshake: still listening — {frames} frames, {eapol_other} EAPOL on other BSSIDs"
+            )));
         }
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
@@ -287,12 +306,21 @@ pub fn capture_loop(
         let Some((_meta, frame)) = radiotap::strip(&buf[..n]) else {
             continue;
         };
+        frames += 1;
+        if frames == 1 {
+            let _ = tx.send(Event::Log(
+                "handshake: receiving frames (radio OK)".to_string(),
+            ));
+        }
         let Some((bssid, _ap_is_sender, eapol)) = parse_eapol(frame) else {
             continue;
         };
-        if bssid != ap {
+        if !targets.contains(&bssid) {
+            eapol_other += 1;
             continue;
         }
+        // Relevant traffic renews the idle window.
+        idle_deadline = Instant::now() + Duration::from_secs(240);
         let sta = crate::dot11::data_endpoints(frame)
             .map(|(a, b)| if a == bssid { b } else { a })
             .unwrap_or(MacAddr::ZERO);
@@ -302,8 +330,9 @@ pub fn capture_loop(
         let Some(key) = parse_eapol_key(eapol) else {
             continue;
         };
-        // Any relevant message renews the idle window.
-        if let Some(cap) = tracker.ingest(ap, sta, essid, &key, tx) {
+        // The FRAME's BSSID is the truth (dual-band: may differ from the
+        // BSSID the user clicked).
+        if let Some(cap) = tracker.ingest(bssid, sta, essid, &key, tx) {
             let _ = tx.send(Event::HandshakeComplete(Box::new(cap)));
             return Ok(true);
         }
