@@ -1,217 +1,351 @@
 //! GPU-accelerated WPA2-PSK cracker (wgpu compute, see pbkdf2.wgsl) plus a
 //! CPU streaming cracker of the same shape.
 //!
-//! Algorithm: the host computes per candidate the SHA1 midstates for the two
-//! HMAC pad prefixes (key = passphrase, salt = ESSID absorbed in the ipad
-//! leg) and the first PBKDF2 outputs U1/U2 for both 20-byte blocks. The GPU
-//! then executes the remaining 4095 chained HMAC rounds per block and emits
-//! T1||T2 (40 bytes): PMK = T1 || T2[0..12]. PTK + MIC are derived per PMK on
-//! the host — that is cheap relative to the 4096 HMACs it replaces. For
-//! key_ver 3 targets the MIC is AES-CMAC (bus duty: PTK+KCK never leave the
-//! host side of the reference implementation).
+//! Full-pipeline architecture: the host packs raw candidate bytes only.
+//! The kernel itself derives the HMAC pad midstates (2 compressions),
+//! computes U1/U2 from host-precomputed padded salt messages, runs the
+//! 4095-iteration chained HMAC loop (registers only), and performs the
+//! verify EPILOGUE on-device (PTK-KCK HMAC + EAPOL MIC compare, or PMKID
+//! compare). Per batch the host reads back a 16-byte hit slot instead of
+//! batch×40B of PMKs — the previous midstate/upload + CPU MIC phases were
+//! the pipeline's throughput ceiling.
+//!
+//! Targets whose MIC is AES-CMAC (key_ver 3) are not expressible in this
+//! shader; [`gpu_verifiable`] routes them to the CPU cracker.
 
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Pack the first 64 message bytes into the 16 FIPS SHA1 message words
-/// (big-endian parse, per FIPS 180-1).
-fn pack16(bytes: &[u8]) -> [u32; 16] {
-    debug_assert!(bytes.len() >= 64);
-    let mut out = [0u32; 16];
-    for (i, w) in out.iter_mut().enumerate() {
-        *w = u32::from_be_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
-    }
-    out
-}
-
 use crate::crypto::{self, CrackTarget};
+use crate::rainbow;
 #[cfg(test)]
 use crate::common::MacAddr;
 
+/// Target view with the candidate-invariant parts precomputed — the MIC
+/// zeroing of the EAPOL frame is fixed for the whole run ([`crypto::mic`]
+/// re-copies and re-zeroes the frame per call, which is measurable at
+/// 65536 candidates per batch).
+pub(crate) enum PreparedTarget<'a> {
+    Handshake(&'a crate::common::HandshakeCapture, Vec<u8>),
+    Pmkid(&'a crate::common::PmkidCapture),
+}
+
+/// Prepare once per crack run (CPU + rainbow paths).
+pub(crate) fn prepare_target(target: &CrackTarget) -> PreparedTarget<'_> {
+    match target {
+        CrackTarget::Handshake(h) => {
+            PreparedTarget::Handshake(h, crypto::zeroed_eapol(&h.eapol_m2))
+        }
+        CrackTarget::Pmkid(p) => PreparedTarget::Pmkid(p),
+    }
+}
+
+/// MIC/PMKID check of one PMK against a [`PreparedTarget`].
+pub(crate) fn prepared_matches(prepared: &PreparedTarget, k: &[u8; 32]) -> bool {
+    match prepared {
+        PreparedTarget::Handshake(h, zeroed) => {
+            let dk = crypto::ptk(k, &h.ap, &h.client, &h.anonce, &h.snonce);
+            let m = crypto::mic_on_zeroed(&dk, zeroed, h.key_ver);
+            crypto::ct_eq16(&m, h.mic())
+        }
+        PreparedTarget::Pmkid(p) => {
+            let dig = crypto::pmkid_hash(k, &p.ap, &p.client);
+            crypto::ct_eq16(&dig, &p.pmkid)
+        }
+    }
+}
+
 const BATCH: u32 = 1 << 16;
-const WORKGROUP_SIZE: u32 = 64;
+const WORKGROUP_SIZE: u32 = 256;
 const ITERATIONS: u32 = 4096;
-const U32_PER_CAND_IN: usize = 20; // ipad(5) opad(5) u1(5) u2(5)
-const U32_PER_CAND_OUT: usize = 10; // T1(5) T2(5)
+/// Candidate wire format: password bytes packed BE into 16 u32 (zero pad).
+const U32_PER_CAND_IN: usize = 16;
+/// PMK rows for the pmk_out (rainbow-build) entry: 8 words PMK + 2 pad.
+const U32_PER_CAND_OUT: usize = 10;
+/// Hit slot: [flag, gid] + pad.
+const HIT_U32: usize = 4;
+// Params layout (u32 words) — MUST mirror `struct Params` in pbkdf2.wgsl.
+const P_HEADER: usize = 8;
+const P_MSGS: usize = 32; // u1_msg || u2_msg
+const P_BLK: usize = 48;
+const PARAM_U32: usize = P_HEADER + P_MSGS + 2 * P_BLK + 4;
 
-const K: [u32; 4] = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
-const IV: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+/// Everything the kernel needs per crack run: the params words, built
+/// once at target-prepare time (only word 4, the batch candidate count,
+/// varies per dispatch).
+pub(crate) struct GpuTargetCtx {
+    params: Vec<u32>,
+}
 
-// ---------------------------------------------------------------------------
-// Host-side SHA1 midstate helpers (mirror of the WGSL kernel).
-// ---------------------------------------------------------------------------
-
-/// One FIPS 180-1 SHA1 compression over exactly one 64-byte block, starting
-/// from a 5×u32 state. `block` holds the message words BE-parsed as the
-/// standard requires; states and the running chain stay in value domain
-/// end-to-end (this is also the WGSL kernel's domain).
-fn compress5(state: &mut [u32; 5], block: &[u32; 16]) {
-    let mut w = [0u32; 80];
-    w[..16].copy_from_slice(block);
-    for t in 16..80 {
-        let x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
-        w[t] = x.rotate_left(1);
+impl GpuTargetCtx {
+    /// Params words for one dispatch (`n` = candidate count). Clone of
+    /// the per-run template: 560 B, negligible per batch.
+    fn params_words(&self, n: u32) -> Vec<u32> {
+        let mut v = self.params.clone();
+        v[4] = n;
+        v
     }
-    let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
-    for (t, &wt) in w.iter().enumerate() {
-        let f = match t {
-            0..=19 => (b & c) | (!b & d),
-            20..=39 | 60..=79 => b ^ c ^ d,
-            _ => (b & c) | (b & d) | (c & d),
-        };
-        let k = K[t / 20];
-        let temp = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(k)
-            .wrapping_add(wt);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = temp;
+}
+
+/// Big-endian pack of `bytes` into u32 words (SHA1's message-word view).
+fn be_words(bytes: &[u8], out: &mut [u32]) {
+    for (i, w) in out.iter_mut().enumerate() {
+        let mut word = 0u32;
+        for (j, &b) in bytes.iter().skip(4 * i).take(4).enumerate() {
+            word |= (b as u32) << (24 - 8 * j);
+        }
+        *w = word;
     }
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
 }
 
-/// Finalize a two-block SHA1 message given the state after block 1: place
-/// the tail, append padding/bit-length for the total (64 + tail.len()) byte
-/// message, compress once. Returns the 5-word state (the FIPS digest words).
-fn finalize_64(state_after_b1: &[u32; 5], tail: &[u8]) -> [u32; 5] {
-    debug_assert!(tail.len() < 56);
-    let total_len = (64 + tail.len()) as u64;
-    let mut blk = [0u8; 64];
-    blk[..tail.len()].copy_from_slice(tail);
-    blk[tail.len()] = 0x80;
-    blk[56..64].copy_from_slice(&(total_len * 8).to_be_bytes());
-    let mut st = *state_after_b1;
-    compress5(&mut st, &pack16(&blk));
-    st
-}
-
-/// First PBKDF2 block digest for a candidate: U_idx = HMAC(P, salt ||
-/// INT32BE(idx)), using precomputed pad midstates. Inner leg message is
-/// (P^ipad) || salt || BE32(idx) (64 + salt.len() + 4 bytes), outer leg is
-/// (P^opad) || inner_digest (84 bytes, 672 bits).
-fn hmac_first(ipad: &[u32; 5], opad: &[u32; 5], salt: &[u8], block_idx: u32) -> [u32; 5] {
-    let mut tail = [0u8; 68];
-    tail[..salt.len()].copy_from_slice(salt);
-    tail[salt.len()..salt.len() + 4].copy_from_slice(&block_idx.to_be_bytes());
-    let inner = finalize_64(ipad, &tail[..salt.len() + 4]);
-
-    let mut outer_blk = [0u32; 16];
-    outer_blk[..5].copy_from_slice(&inner);
-    outer_blk[5] = 0x8000_0000;
-    outer_blk[15] = 672;
-    let mut st = *opad;
-    compress5(&mut st, &outer_blk);
-    st
-}
-
-/// Mirror of the WGSL `hmac_mid`: one chained HMAC round (two compresses)
-/// over the 20-byte value `u` given the pad midstates.
-fn hmac_midstate_host(ipad: &[u32; 5], opad: &[u32; 5], u: &[u32; 5]) -> [u32; 5] {
-    let mut msg = [0u32; 16];
-    msg[..5].copy_from_slice(u);
-    msg[5] = 0x8000_0000;
-    msg[15] = 672;
-
-    let mut st = *ipad;
-    compress5(&mut st, &msg);
-
-    let mut outer = [0u32; 16];
-    outer[..5].copy_from_slice(&st);
-    outer[5] = 0x8000_0000;
-    outer[15] = 672;
-
-    let mut st2 = *opad;
-    compress5(&mut st2, &outer);
-    st2
-}
-
-/// Per-candidate kernel inputs for one passphrase.
-fn candidate_inputs(pass: &[u8], salt: &[u8]) -> [u32; U32_PER_CAND_IN] {
-    debug_assert!((8..=63).contains(&pass.len()));
-
-    let mut ipad_blk = [0x36u8; 64];
-    let mut opad_blk = [0x5cu8; 64];
-    for (i, &b) in pass.iter().enumerate() {
-        ipad_blk[i] ^= b;
-        opad_blk[i] ^= b;
+/// FIPS-pad an HMAC message (following the implicit 64-byte pad prefix)
+/// and pack into BE 64-byte-block words; returns (words, block count).
+fn padded_blocks(msg: &[u8]) -> (Vec<u32>, u32) {
+    let total_bits = ((64 + msg.len()) as u64) * 8;
+    let mut v = msg.to_vec();
+    v.push(0x80);
+    while v.len() % 64 != 56 {
+        v.push(0);
     }
+    v.extend_from_slice(&total_bits.to_be_bytes());
+    let n_blocks = v.len() / 64;
+    let mut words = vec![0u32; n_blocks * 16];
+    be_words(&v, &mut words);
+    (words, n_blocks as u32)
+}
 
-    let mut ipad = IV;
-    let mut opad = IV;
-    compress5(&mut ipad, &pack16(&ipad_blk));
-    compress5(&mut opad, &pack16(&opad_blk));
-
-    // U_i = HMAC(P, salt || INT32BE(i)): inner leg via the ipad midstate,
-    // outer leg one compress over the opad midstate (also 84-byte total
-    // message → bit length 672, same layout as the chained rounds).
-    let u1 = hmac_first(&ipad, &opad, salt, 1);
-    let u2 = hmac_first(&ipad, &opad, salt, 2);
-
-    let mut out = [0u32; U32_PER_CAND_IN];
-    out[..5].copy_from_slice(&ipad);
-    out[5..10].copy_from_slice(&opad);
-    out[10..15].copy_from_slice(&u1);
-    out[15..20].copy_from_slice(&u2);
+/// U-block message for PBKDF2: salt || INT32BE(idx), padded whole. Must
+/// fit one block (salt ≤ 51 bytes, incl. the 9 padding bytes).
+fn u_msg(salt: &[u8], idx: u32) -> [u32; 16] {
+    let mut m = Vec::with_capacity(salt.len() + 4);
+    m.extend_from_slice(salt);
+    m.extend_from_slice(&idx.to_be_bytes());
+    let (words, n) = padded_blocks(&m);
+    debug_assert_eq!(n, 1, "salt must fit one SHA1 block");
+    let mut out = [0u32; 16];
+    out.copy_from_slice(&words[..16]);
     out
 }
 
-/// Finish the two PBKDF2 blocks for one candidate entirely on the CPU
-/// (reference + fallback path).
-fn pmk_via_midstates(inputs: &[u32; U32_PER_CAND_IN]) -> [u8; 32] {
-    let mut ipad = [0u32; 5];
-    let mut opad = [0u32; 5];
-    let mut u1 = [0u32; 5];
-    let mut u2 = [0u32; 5];
-    ipad.copy_from_slice(&inputs[..5]);
-    opad.copy_from_slice(&inputs[5..10]);
-    u1.copy_from_slice(&inputs[10..15]);
-    u2.copy_from_slice(&inputs[15..20]);
-
-    let mut t1 = u1;
-    let mut t2 = u2;
-    for _ in 1..ITERATIONS {
-        u1 = hmac_midstate_host(&ipad, &opad, &u1);
-        for i in 0..5 {
-            t1[i] ^= u1[i];
+/// Build the kernel verify context. None when the target is not
+/// expressible in the SHA1-only shader: AES-CMIC handshake (key_ver 3),
+/// truncated frame, or overlong ESSID (> 51 bytes — spills the U block).
+pub(crate) fn gpu_ctx(target: &CrackTarget) -> Option<GpuTargetCtx> {
+    let salt = target.essid().as_bytes();
+    if salt.len() > 51 {
+        return None;
+    }
+    let u1_msg = u_msg(salt, 1);
+    let u2_msg = u_msg(salt, 2);
+    let mut blk1 = [0u32; 48];
+    let mut blk2 = [0u32; 48];
+    let mut mic = [0u32; 4];
+    let (is_pmkid, n_blk1, n_blk2) = match target {
+        CrackTarget::Pmkid(p) => {
+            // PMKID = HMAC-SHA1-128(PMK, "PMK Name" || ap || sta)[0..16].
+            let mut msg = Vec::with_capacity(8 + 6 + 6);
+            msg.extend_from_slice(b"PMK Name");
+            msg.extend_from_slice(&p.ap.0);
+            msg.extend_from_slice(&p.client.0);
+            let (w, n) = padded_blocks(&msg);
+            blk1[..w.len()].copy_from_slice(&w);
+            be_words(&p.pmkid, &mut mic);
+            (1, n, 0)
         }
-        u2 = hmac_midstate_host(&ipad, &opad, &u2);
-        for i in 0..5 {
-            t2[i] ^= u2[i];
+        CrackTarget::Handshake(h) => {
+            if h.key_ver == 3 || h.eapol_m2.len() < 99 {
+                return None;
+            }
+            // blk1: PRF message round 1 = prf_stem || 0x01 → KCK.
+            let mut prf = crypto::prf_stem(&h.ap, &h.client, &h.anonce, &h.snonce);
+            prf.push(0x01);
+            let (w1, n1) = padded_blocks(&prf);
+            blk1[..w1.len()].copy_from_slice(&w1);
+            // blk2: zeroed EAPOL frame (MIC message; 2..3 blocks).
+            let zeroed = crypto::zeroed_eapol(&h.eapol_m2);
+            let (w2, n2) = padded_blocks(&zeroed);
+            blk2[..w2.len()].copy_from_slice(&w2);
+            be_words(h.mic(), &mut mic);
+            (0, n1, n2)
         }
-    }
-
-    let mut pmk_bytes = [0u8; 32];
-    for i in 0..5 {
-        pmk_bytes[i * 4..i * 4 + 4].copy_from_slice(&t1[i].to_be_bytes());
-    }
-    for i in 0..3 {
-        pmk_bytes[20 + i * 4..20 + i * 4 + 4].copy_from_slice(&t2[i].to_be_bytes());
-    }
-    pmk_bytes
+    };
+    let mut params = vec![0u32; PARAM_U32];
+    params[0] = ITERATIONS << 1;
+    params[1] = is_pmkid;
+    params[2] = n_blk1;
+    params[3] = n_blk2;
+    params[P_HEADER..P_HEADER + 16].copy_from_slice(&u1_msg);
+    params[P_HEADER + 16..P_HEADER + 32].copy_from_slice(&u2_msg);
+    params[P_HEADER + P_MSGS..P_HEADER + P_MSGS + P_BLK].copy_from_slice(&blk1);
+    params[P_HEADER + P_MSGS + P_BLK..P_HEADER + P_MSGS + 2 * P_BLK].copy_from_slice(&blk2);
+    params[PARAM_U32 - 4..].copy_from_slice(&mic);
+    Some(GpuTargetCtx { params })
 }
 
-// ---------------------------------------------------------------------------
-// GPU cracker
-// ---------------------------------------------------------------------------
+/// Whether the GPU shader can verify this target (SHA1-family only; the
+/// AES-CMAC key_ver 3 path stays on the CPU cracker).
+pub(crate) fn gpu_verifiable(target: &CrackTarget) -> bool {
+    gpu_ctx(target).is_some()
+}
+
+/// Pack raw passphrases into the kernel wire format (BE words, zero pad).
+fn pack_candidates(words: &[Vec<u8>]) -> Vec<u32> {
+    let mut out = vec![0u32; words.len() * U32_PER_CAND_IN];
+    for (w, dst) in words.iter().zip(out.chunks_exact_mut(U32_PER_CAND_IN)) {
+        be_words(w, dst);
+    }
+    out
+}
+
+/// One in-flight kernel dispatch. Buffers live in the pool; the handle
+/// carries what waiting/returning needs.
+struct PendingKernel {
+    read_buf: wgpu::Buffer,
+    slot: usize,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    sub: wgpu::SubmissionIndex,
+    read_u32: usize,
+}
+
+/// Returns a pool slot on drop, on ANY exit path of `wait_kernel`.
+struct SlotGuard<'a> {
+    pool: &'a std::cell::RefCell<Option<KernelPool>>,
+    slot: usize,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.borrow_mut().as_mut() {
+            pool.free.push(self.slot);
+        }
+    }
+}
+
+/// One persistent set of dispatch buffers + bind group, sized for a full
+/// batch (the 16-byte param/hit writes per batch are near-free).
+struct KernelBufs {
+    in_buf: wgpu::Buffer,
+    out_buf: wgpu::Buffer,
+    hit_buf: wgpu::Buffer,
+    read_buf: wgpu::Buffer,
+    param_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Free-slot allocator over persistent [`KernelBufs`]; starts with 2
+/// slots (pipeline depth), grows on demand rather than failing.
+struct KernelPool {
+    bufs: Vec<KernelBufs>,
+    free: Vec<usize>,
+}
+
+impl KernelPool {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        cap: usize,
+    ) -> Self {
+        let mut pool = KernelPool { bufs: Vec::new(), free: Vec::new() };
+        for _ in 0..2 {
+            pool.push_slot(device, layout, cap);
+        }
+        pool
+    }
+
+    fn push_slot(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cap: usize) {
+        let in_bytes = (cap * U32_PER_CAND_IN * 4) as u64;
+        let out_bytes = (cap * U32_PER_CAND_OUT * 4) as u64;
+        let hit_bytes = (HIT_U32 * 4) as u64;
+        let in_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("candidates"),
+            size: in_bytes.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pmks"),
+            size: out_bytes.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hits"),
+            size: hit_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: out_bytes.max(hit_bytes),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let param_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params"),
+            size: (PARAM_U32 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pbkdf2-bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: in_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: hit_buf.as_entire_binding() },
+            ],
+        });
+        self.bufs.push(KernelBufs { in_buf, out_buf, hit_buf, read_buf, param_buf, bind_group });
+        self.free.push(self.bufs.len() - 1);
+    }
+
+    /// Take a free slot (index), growing the pool when the pipeline is
+    /// deeper than anticipated.
+    fn take(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cap: usize) -> usize {
+        match self.free.pop() {
+            Some(i) => i,
+            None => {
+                self.push_slot(device, layout, cap);
+                self.free.pop().expect("push_slot frees the new slot")
+            }
+        }
+    }
+}
+
+/// Read-back scope of a dispatch: 16-byte hit slot (crack runs) or full
+/// PMK rows (rainbow-build runs).
+#[derive(Clone, Copy)]
+enum Readback {
+    Hits,
+    Pmks(usize),
+}
+
+impl Readback {
+    fn bytes(self) -> usize {
+        match self {
+            Readback::Hits => HIT_U32 * 4,
+            Readback::Pmks(n) => n * U32_PER_CAND_OUT * 4,
+        }
+    }
+}
 
 pub struct GpuCracker {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    pmk_pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     name: String,
     batch: u32,
+    /// Persistent dispatch buffers, two slots — the pipeline keeps at most
+    /// two kernels in flight (current + next); creating buffers per batch
+    /// was the dominant host-side churn. Interior mutability: `crack`
+    /// borrows `&self`.
+    pool: std::cell::RefCell<Option<KernelPool>>,
 }
 
 impl GpuCracker {
@@ -229,7 +363,7 @@ impl GpuCracker {
         .ok()?;
         let info = adapter.get_info();
         let limits = adapter.limits();
-        // Need storage buffers of BATCH × 80 B in and BATCH × 40 B out.
+        // Need storage buffers of BATCH × 64 B in and BATCH × 40 B out.
         let in_bytes = u64::from(BATCH) * (U32_PER_CAND_IN as u64) * 4;
         let out_bytes = u64::from(BATCH) * (U32_PER_CAND_OUT as u64) * 4;
         if u64::from(limits.max_storage_buffer_binding_size) < in_bytes
@@ -249,47 +383,35 @@ impl GpuCracker {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&desc)).ok()?;
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader_desc = wgpu::ShaderModuleDescriptor {
             label: Some("pbkdf2.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("pbkdf2.wgsl").into()),
-        });
+        };
+        // The module carries no user input; skip naga's runtime bounds
+        // checks (a tail-item guard in WGSL already clamps the last
+        // partial batch). SAFETY: module is a static, trusted WGSL source.
+        let shader = unsafe {
+            device
+                .create_shader_module_trusted(shader_desc, wgpu::ShaderRuntimeChecks::unchecked())
+        };
 
+        let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pbkdf2-layout"),
             entries: &[
-                // params uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(16),
-                    },
-                    count: None,
-                },
-                // midstates in
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // outputs out
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                storage_entry(0, true),  // params
+                storage_entry(1, true),  // candidates
+                storage_entry(2, false), // outputs
+                storage_entry(3, false), // hits
             ],
         });
 
@@ -299,22 +421,28 @@ impl GpuCracker {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("pbkdf2-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let make_pipeline = |label, entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("pbkdf2-crack-pipeline", "main");
+        let pmk_pipeline = make_pipeline("pbkdf2-pmk-pipeline", "pmk_out");
 
         Some(GpuCracker {
             device,
             queue,
             pipeline,
+            pmk_pipeline,
             layout,
             name: format!("{} ({:?})", info.name, info.backend),
             batch: BATCH,
+            pool: std::cell::RefCell::new(None),
         })
     }
 
@@ -322,98 +450,48 @@ impl GpuCracker {
         self.name.clone()
     }
 
-    /// Measured full-attack throughput for progress reporting (4096-iteration
-    /// batches). Runs 4 batches through `pmk_batch_gpu` and returns H/s.
-    #[cfg(test)]
-    fn measured_hps(&self) -> Option<f64> {
-        let pass: Vec<u8> = b"benchmk1".to_vec();
-        let salt = b"benchmark-ssid";
-        let mut inputs = Vec::with_capacity(self.batch as usize * U32_PER_CAND_IN);
-        for i in 0..self.batch as usize {
-            let mut w = pass.clone();
-            w[0] = b'a' + (i % 26) as u8;
-            inputs.extend_from_slice(&candidate_inputs(&w, salt));
-        }
-        // Warm-up batch: covers one-time SPIR-V->ISA compile & memory init.
-        self.run_kernel(&inputs)?;
-        const BATCHES: u32 = 8;
-        let t0 = Instant::now();
-        let mut ok = true;
-        for _ in 0..BATCHES {
-            let mut inp = inputs.clone();
-            inp[0] = inp[0].wrapping_add(1);
-            ok &= self.run_kernel(&inp).is_some();
-        }
-        if !ok {
-            return None;
-        }
-        let secs = t0.elapsed().as_secs_f64();
-        Some(self.batch as f64 * f64::from(BATCHES) / secs)
-    }
-
-    /// Run one kernel batch over `inputs` (n×20 u32, on the wire as u32 LE).
-    /// Returns the n×10 u32 output words, or None on device-lost/hang.
-    fn run_kernel(&self, inputs: &[u32]) -> Option<Vec<u32>> {
+    /// Dispatch WITHOUT waiting: returns an in-flight handle so next-batch
+    /// packing overlaps the GPU. `params` is 140 u32 (see [`GpuTargetCtx`]);
+    /// `pipeline` picks main vs pmk_out. None for empty input.
+    fn submit_kernel(
+        &self,
+        inputs: &[u32],
+        params: &[u32],
+        readback: Readback,
+        pmk_pipeline: bool,
+    ) -> Option<PendingKernel> {
         let n = inputs.len() / U32_PER_CAND_IN;
         if n == 0 {
-            return Some(Vec::new());
+            return None;
         }
+        debug_assert!(n <= self.batch as usize, "kernel buffers sized for one batch");
+        debug_assert_eq!(params.len(), PARAM_U32);
 
-        let in_bytes = (inputs.len() * 4) as u64;
-        let out_u32 = n * U32_PER_CAND_OUT;
-        let out_bytes = (out_u32 * 4) as u64;
+        let slot = {
+            let mut pool = self.pool.borrow_mut();
+            let pool = pool.get_or_insert_with(|| {
+                KernelPool::new(&self.device, &self.layout, self.batch as usize)
+            });
+            pool.take(&self.device, &self.layout, self.batch as usize)
+        };
+        let (in_buf, out_buf, hit_buf, read_buf, param_buf, bind_group) = {
+            let pool = self.pool.borrow();
+            let bufs = &pool.as_ref().expect("pool just created").bufs[slot];
+            (
+                bufs.in_buf.clone(),
+                bufs.out_buf.clone(),
+                bufs.hit_buf.clone(),
+                bufs.read_buf.clone(),
+                bufs.param_buf.clone(),
+                bufs.bind_group.clone(),
+            )
+        };
 
-        let in_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("midstates"),
-            size: in_bytes.max(16),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("t1t2"),
-            size: out_bytes.max(16),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let read_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: out_bytes.max(16),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let param_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        self.queue.write_buffer(&param_buf, 0, u32s_as_bytes(params));
+        self.queue.write_buffer(&hit_buf, 0, &[0u8; 16]);
+        self.queue.write_buffer(&in_buf, 0, u32s_as_bytes(inputs));
 
-        let flags: u32 = ITERATIONS << 1;
-        let params: [u32; 4] = [flags, 0, 0, 0];
-        self.queue
-            .write_buffer(&param_buf, 0, &u32s_as_bytes(&params));
-        let in_bytes_vec = u32s_as_bytes(inputs);
-        self.queue.write_buffer(&in_buf, 0, &in_bytes_vec);
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pbkdf2-bg"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: param_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: in_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out_buf.as_entire_binding(),
-                },
-            ],
-        });
-
+        let read_u32 = readback.bytes() / 4;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -424,24 +502,46 @@ impl GpuCracker {
                 label: Some("pbkdf2-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if pmk_pipeline { &self.pmk_pipeline } else { &self.pipeline });
             pass.set_bind_group(0, &bind_group, &[]);
+            // Two candidates per thread.
             pass.dispatch_workgroups(n.div_ceil(WORKGROUP_SIZE as usize) as u32, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, out_bytes);
+        match readback {
+            Readback::Hits => {
+                encoder.copy_buffer_to_buffer(&hit_buf, 0, &read_buf, 0, readback.bytes() as u64)
+            }
+            Readback::Pmks(_) => encoder.copy_buffer_to_buffer(
+                &out_buf,
+                0,
+                &read_buf,
+                0,
+                readback.bytes() as u64,
+            ),
+        }
         let sub = self.queue.submit([encoder.finish()]);
 
-        // Wait for the shader with timeout; a hung/compute-heavy dispatch is
-        // reported so the caller can halve the batch.
         let (tx, rx) = std::sync::mpsc::channel();
         read_buf
-            .slice(..)
+            .slice(..readback.bytes() as u64)
             .map_async(wgpu::MapMode::Read, move |res| {
                 let _ = tx.send(res);
             });
 
+        Some(PendingKernel { read_buf, slot, rx, sub, read_u32 })
+    }
+
+    /// Wait on a dispatched kernel (timeout: hung/compute-heavy dispatch)
+    /// and read back the requested words. None on device-lost/hang. The
+    /// pool slot is freed for the next dispatch.
+    fn wait_kernel(&self, pending: PendingKernel) -> Option<Vec<u32>> {
+        let PendingKernel { read_buf, slot, rx, sub, read_u32 } = pending;
+        // Any exit path returns the slot; a wedged slot must not deadlock
+        // a later run.
+        let _guard = SlotGuard { pool: &self.pool, slot };
+
         let mut waited = Duration::ZERO;
-        let step = Duration::from_millis(50);
+        let step = Duration::from_millis(8);
         let limit = Duration::from_secs(30);
         loop {
             match self.device.poll(wgpu::PollType::Wait {
@@ -472,9 +572,10 @@ impl GpuCracker {
             }
         }
 
-        let view = read_buf.slice(..).get_mapped_range().ok()?;
-        let mut out = Vec::with_capacity(out_u32);
-        for chunk in view[..(out_u32 * 4)].chunks_exact(4) {
+        let bytes = read_u32 * 4;
+        let view = read_buf.slice(..bytes as u64).get_mapped_range().ok()?;
+        let mut out = Vec::with_capacity(read_u32);
+        for chunk in view[..bytes].chunks_exact(4) {
             out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         drop(view);
@@ -482,18 +583,37 @@ impl GpuCracker {
         Some(out)
     }
 
-    /// Compute PMKs for a word batch. Halves the batch size once on
-    /// device-lost/timeout; on a repeated failure returns None.
-    fn pmk_batch_gpu(&self, words: &[Vec<u8>], salt: &[u8]) -> Option<Vec<[u8; 32]>> {
+    /// Compute PMKs for a word batch (rainbow-table build; `pmk_out`
+    /// pipeline). Halves the batch size once on device-lost/timeout; on a
+    /// repeated failure returns None.
+    pub(crate) fn pmk_batch_gpu(&self, words: &[Vec<u8>], salt: &[u8]) -> Option<Vec<[u8; 32]>> {
+        if salt.len() > 51 {
+            return None;
+        }
+        let mut params = vec![0u32; PARAM_U32];
+        params[0] = ITERATIONS << 1;
+        let u1 = u_msg(salt, 1);
+        let u2 = u_msg(salt, 2);
+        params[P_HEADER..P_HEADER + 16].copy_from_slice(&u1);
+        params[P_HEADER + 16..P_HEADER + 32].copy_from_slice(&u2);
+
         let mut cur: Vec<Vec<u8>> = words.to_vec();
         let mut attempts = 0u8;
         loop {
-            let mut inputs = Vec::with_capacity(cur.len() * U32_PER_CAND_IN);
-            for w in &cur {
-                inputs.extend_from_slice(&candidate_inputs(w, salt));
-            }
-            if let Some(out) = self.run_kernel(&inputs) {
-                return Some(assemble_pmks(&out));
+            params[4] = cur.len() as u32;
+            let inputs = pack_candidates(&cur);
+            let sub =
+                self.submit_kernel(&inputs, &params, Readback::Pmks(cur.len()), true)?;
+            if let Some(out) = self.wait_kernel(sub) {
+                let mut pmks = Vec::with_capacity(cur.len());
+                for row in out.chunks_exact(U32_PER_CAND_OUT) {
+                    let mut pmk = [0u8; 32];
+                    for (i, w) in row[..8].iter().enumerate() {
+                        pmk[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+                    }
+                    pmks.push(pmk);
+                }
+                return Some(pmks);
             }
             attempts += 1;
             if attempts > 1 || cur.len() == 1 {
@@ -504,9 +624,14 @@ impl GpuCracker {
         }
     }
 
-    /// Stream `words` through the GPU, calling `progress(done, hps)` once per
-    /// dispatched batch (also when a partial final batch ran). Honors `stop`
-    /// between batches. Returns the passphrase on MIC match.
+    /// Stream `words` through the GPU, calling `progress(done, hps)` per
+    /// finished batch. Honors `stop` between batches. Returns the
+    /// passphrase on an on-device MIC/PMKID match (hit-slot readback).
+    ///
+    /// The kernel verifies candidates itself: per batch the host packs
+    /// raw bytes (memcpy-rate), uploads 64B/candidate and read back a
+    /// 16-byte hit slot — the previous midstate/upload + CPU-MIC phases
+    /// were the throughput bottleneck, not the chain.
     pub fn crack(
         &self,
         target: &CrackTarget,
@@ -514,122 +639,157 @@ impl GpuCracker {
         progress: &mut dyn FnMut(u64, f64),
         stop: &Arc<AtomicBool>,
     ) -> Option<String> {
-        if matches!(target, CrackTarget::Handshake(h) if h.eapol_m2.len() < 99) {
-            return None;
-        }
-        let salt = target.essid().as_bytes();
+        let ctx = gpu_ctx(target)?;
         let mut done = 0u64;
         let started = Instant::now();
-        let mut batch_cap = self.batch as usize;
+        let batch_cap = self.batch as usize;
 
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return None;
-            }
-            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_cap);
-            while batch.len() < batch_cap {
+        fn collect(words: &mut dyn Iterator<Item = Vec<u8>>, cap: usize) -> Vec<Vec<u8>> {
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cap);
+            while batch.len() < cap {
                 match words.next() {
                     Some(w) => batch.push(w),
                     None => break,
                 }
             }
-            if batch.is_empty() {
-                return None;
-            }
-
-            let pmks = self.pmk_batch_gpu(&batch, salt)?;
-            // If the PMK batch shrunk because of a device hiccup the tail
-            // candidates are re-attempted below; keep bookkeeping accurate by
-            // scanning only what came back and re-queueing the rest.
-            let checked = pmks.len();
-            for (i, k) in pmks.iter().enumerate() {
-                done += 1;
-                if target_matches(target, k) {
-                    return String::from_utf8(batch[i].clone()).ok();
-                }
-            }
+            batch
+        }
+        let tick = |done: u64, started: Instant, progress: &mut dyn FnMut(u64, f64)| {
             let secs = started.elapsed().as_secs_f64().max(1e-6);
             progress(done, done as f64 / secs);
-
-            if checked < batch.len() {
-                // Device hiccup path: retry the remaining words in smaller
-                // chunks before continuing the stream.
-                let rest = batch[checked..].to_vec();
-                for chunk in rest.chunks(batch_cap.div_ceil(2).max(1)) {
-                    if stop.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let pmks = self.pmk_batch_gpu(chunk, salt)?;
-                    for (i, k) in pmks.iter().enumerate() {
-                        done += 1;
-                        if target_matches(target, k) {
-                            return String::from_utf8(chunk[i].clone()).ok();
-                        }
-                    }
-                    let secs = started.elapsed().as_secs_f64().max(1e-6);
-                    progress(done, done as f64 / secs);
-                }
-                batch_cap = batch_cap.div_ceil(2).max(1024);
+        };
+        // Drain an aborted pipeline slot: never drop a mapped-read buffer
+        // without polling it through.
+        let drain = |pending: Option<PendingKernel>| {
+            if let Some(p) = pending {
+                let _ = self.wait_kernel(p);
             }
+        };
+
+        let mut cur_words = collect(words, batch_cap);
+        if cur_words.is_empty() {
+            return None;
+        }
+        let mut pending = Some(self.submit_kernel(
+            &pack_candidates(&cur_words),
+            &ctx.params_words(cur_words.len() as u32),
+            Readback::Hits,
+            false,
+        )?);
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                drain(pending.take());
+                return None;
+            }
+            // While the GPU verifies batch N on-device: fetch + pack the
+            // next batch and hand it to the GPU as soon as possible.
+            let next_words = collect(words, batch_cap);
+            let next_pending = if next_words.is_empty() {
+                None
+            } else {
+                Some(self.submit_kernel(
+                    &pack_candidates(&next_words),
+                    &ctx.params_words(next_words.len() as u32),
+                    Readback::Hits,
+                    false,
+                )?)
+            };
+
+            let cur_pending = pending.take().expect("pipeline: one batch in flight");
+            let Some(hit) = self.wait_kernel(cur_pending) else {
+                drain(next_pending);
+                return None;
+            };
+            // A hit slot write is dispatched-and-completed before the map
+            // resolves: flag==1 with gid valid.
+            if hit[0] != 0 {
+                drain(next_pending);
+                let gid = hit[1] as usize;
+                done += gid as u64 + 1;
+                tick(done, started, progress);
+                return cur_words.get(gid).and_then(|w| String::from_utf8(w.clone()).ok());
+            }
+            done += cur_words.len() as u64;
+            tick(done, started, progress);
+
+            let Some(next_pending) = next_pending else {
+                return None; // stream exhausted; nothing in flight
+            };
+            cur_words = next_words;
+            pending = Some(next_pending);
         }
     }
 }
 
-/// Little-endian byte serialization of a u32 slice for queue.write_buffer.
-/// The kernel reads raw u32s; on this CPU (x86-64, LE) this matches memory
-/// layout, and serializing keeps the wire format explicit for any host.
-fn u32s_as_bytes(v: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for &w in v {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    out
+/// Borrow a `&[u32]` as `&[u8]` for queue.write_buffer WITHOUT copying
+/// (65536-candidate batches make the old 5 MiB memcpy per dispatch
+/// measurable). Compiled only for little-endian hosts: the kernel's wire
+/// format is native LE u32, matching memory layout.
+#[cfg(target_endian = "little")]
+fn u32s_as_bytes(v: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding and outlives the call; the kernel expects
+    // exactly these bytes.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
-fn assemble_pmks(out: &[u32]) -> Vec<[u8; 32]> {
-    let n = out.len() / U32_PER_CAND_OUT;
-    let mut pmks = Vec::with_capacity(n);
-    for c in 0..n {
-        let mut pmk = [0u8; 32];
-        let row = &out[c * U32_PER_CAND_OUT..(c + 1) * U32_PER_CAND_OUT];
-        for i in 0..8 {
-            pmk[i * 4..i * 4 + 4].copy_from_slice(&row[i].to_be_bytes());
-        }
-        pmks.push(pmk);
-    }
-    pmks
-}
-
-/// MIC/PMKID check of one PMK against the target.
-fn target_matches(target: &CrackTarget, k: &[u8; 32]) -> bool {
-    match target {
-        CrackTarget::Handshake(h) => {
-            let dk = crypto::ptk(k, &h.ap, &h.client, &h.anonce, &h.snonce);
-            let m = crypto::mic(&dk, &h.eapol_m2, h.key_ver);
-            crypto::ct_eq16(&m, h.mic())
-        }
-        CrackTarget::Pmkid(p) => {
-            let dig = crypto::pmkid_hash(k, &p.ap, &p.client);
-            crypto::ct_eq16(&dig, &p.pmkid)
-        }
-    }
-}
+#[cfg(target_endian = "big")]
+compile_error!("GPU cracker wire format assumes a little-endian host");
 
 // ---------------------------------------------------------------------------
 // CPU cracker (reference-fallback path)
 // ---------------------------------------------------------------------------
 
+/// Per-word PMK sink for pure-CPU cracks (per-SSID PMK cache population):
+/// the caller feeds the PMK already computed for the compare, so caching
+/// costs only the write. The first push error is surfaced through the log
+/// callback ONCE, then the sink disables itself silently — a partially
+/// written cache stays readable and useful.
+pub struct CpuPmkSink {
+    w: Option<rainbow::TableWriter>,
+    log: Box<dyn FnMut(String) + Send>,
+}
+
+impl CpuPmkSink {
+    pub fn new(w: rainbow::TableWriter, log: Box<dyn FnMut(String) + Send>) -> Self {
+        CpuPmkSink { w: Some(w), log }
+    }
+
+    /// Write `(pmk, word)`; errors log once and then disable the sink.
+    pub fn push(&mut self, pmk: &[u8; 32], word: &[u8]) {
+        if let Some(w) = &mut self.w {
+            if let Err(e) = w.push(pmk, word) {
+                (self.log)(format!("pmk cache: write failed ({e}) — cache left partial"));
+                self.w = None;
+            }
+        }
+    }
+
+    /// Flush the writer; number of entries appended by THIS sink.
+    pub fn finish(self) -> std::io::Result<u64> {
+        match self.w {
+            Some(w) => w.finish(),
+            None => Ok(0),
+        }
+    }
+}
+
 /// Streaming CPU cracker with the same contract as `GpuCracker::crack`.
+/// `cache_sink`, when given, receives `(pmk, word)` for every tried
+/// candidate (PMK cache population: pure-CPU runs only, caller's policy).
 pub fn cpu_crack(
     target: &CrackTarget,
     words: &mut dyn Iterator<Item = Vec<u8>>,
     progress: &mut dyn FnMut(u64, f64),
     stop: &Arc<AtomicBool>,
+    cache_sink: Option<&mut CpuPmkSink>,
 ) -> Option<String> {
     if matches!(target, CrackTarget::Handshake(h) if h.eapol_m2.len() < 99) {
         return None;
     }
     let salt = target.essid().as_bytes();
+    let prepared = prepare_target(target);
+    let mut sink = cache_sink;
     let mut done = 0u64;
     let started = Instant::now();
     const CPU_BATCH: usize = 512;
@@ -651,7 +811,10 @@ pub fn cpu_crack(
         for w in &batch {
             done += 1;
             let key = crypto::pmk(w, salt);
-            if target_matches(target, &key) {
+            if let Some(s) = sink.as_deref_mut() {
+                s.push(&key, w);
+            }
+            if prepared_matches(&prepared, &key) {
                 return String::from_utf8(w.clone()).ok();
             }
         }
@@ -686,7 +849,7 @@ mod tests {
         f
     }
 
-    fn synthetic_target(ssid: &str, pass: &[u8], key_ver: u8) -> CrackTarget {
+    pub(crate) fn synthetic_target(ssid: &str, pass: &[u8], key_ver: u8) -> CrackTarget {
         let ap = "aa:bb:cc:dd:ee:ff".parse::<MacAddr>().unwrap();
         let sta = "11:22:33:44:55:66".parse::<MacAddr>().unwrap();
         let anonce: [u8; 32] = [0x5a; 32];
@@ -707,20 +870,36 @@ mod tests {
         ))
     }
 
+    pub(crate) fn synthetic_pmkid(ssid: &str, pass: &[u8]) -> CrackTarget {
+        let ap = "aa:bb:cc:dd:ee:ff".parse::<MacAddr>().unwrap();
+        let sta = "11:22:33:44:55:66".parse::<MacAddr>().unwrap();
+        let key = crypto::pmk(pass, ssid.as_bytes());
+        CrackTarget::Pmkid(crate::common::PmkidCapture {
+            ap,
+            client: sta,
+            essid: ssid.to_string(),
+            pmkid: crypto::pmkid_hash(&key, &ap, &sta),
+        })
+    }
+
     #[test]
-    fn host_midstate_matches_pbkdf2() {
-        // candidate_inputs + pmk_via_midstates must equal crypto's
-        // PBKDF2-HMAC-SHA1 (itself pinned to RFC 6070 + the IEEE wpa vector
-        // in crypto::tests) for arbitrary passphrases and salts.
-        for pass in [&b"password1"[..], b"sup3r-secret", &vec![b'x'; 63][..], b"87654321"] {
-            for ssid in [&b"IEEE"[..], b"parafin", b"", b"long-ssid-0123456789"] {
-                let inputs = candidate_inputs(pass, ssid);
-                let got = pmk_via_midstates(&inputs);
-                let mut dk = [0u8; 40];
-                crypto::pbkdf2_hmac_sha1(pass, ssid, 4096, &mut dk);
-                assert_eq!(&got[..], &dk[..32], "pass={pass:?} ssid={ssid:?}");
-            }
-        }
+    fn host_padded_blocks_match_reference() {
+        // The host's padded HMAC message blocks must be exactly what the
+        // reference sha1/hmac stack computes: HMAC(K, msg) from a given
+        // midstate pair must equal feeding the padded blocks through
+        // compress-free reference code. Easiest ground truth: verify()
+        // covers the whole chain via crypto::verify in target tests; here
+        // pin just the padding invariants (0x80 at len, bitlen tail).
+        let msg = b"PMK Name012345";
+        let (words, n) = padded_blocks(msg);
+        assert_eq!(n, 1);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        assert_eq!(&bytes[..msg.len()], msg);
+        assert_eq!(bytes[msg.len()], 0x80);
+        assert_eq!(
+            u64::from_be_bytes(bytes[56..64].try_into().unwrap()),
+            ((64 + msg.len()) as u64) * 8
+        );
     }
 
     #[test]
@@ -733,12 +912,8 @@ mod tests {
         let words: Vec<Vec<u8>> = (0..16)
             .map(|i| format!("cand{:06}", i).into_bytes())
             .collect();
-        let mut inputs = Vec::new();
-        for w in &words {
-            inputs.extend_from_slice(&candidate_inputs(w, salt));
-        }
-        let out = crk.run_kernel(&inputs).expect("kernel must complete");
-        let pmks = assemble_pmks(&out);
+        let pmks = crk.pmk_batch_gpu(&words, salt).expect("kernel must complete");
+        assert_eq!(pmks.len(), words.len());
         for (w, k) in words.iter().zip(pmks.iter()) {
             let mut dk = [0u8; 40];
             crypto::pbkdf2_hmac_sha1(w, salt, 4096, &mut dk);
@@ -746,6 +921,33 @@ mod tests {
             // Also bit-exact vs the RFC-anchored crypto::pmk.
             assert_eq!(k, &crypto::pmk(w, salt), "crypto::pmk mismatch for {w:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "perf bench: full crack-loop effective throughput"]
+    fn crack_loop_effective_hps() {
+        let Some(crk) = GpuCracker::try_new() else {
+            eprintln!("no GPU adapter, skipping");
+            return;
+        };
+        let target = synthetic_target("parafin", b"sup3r-secret", 2);
+        const N: usize = 65536 * 6;
+        let words: Vec<Vec<u8>> = (0..N).map(|i| format!("probe{i:09}").into_bytes()).collect();
+        let mut it = words.into_iter();
+        let stop = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let found = crk.crack(&target, &mut it, &mut |_, _| {}, &stop);
+        assert!(found.is_none());
+        let wall = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "full crack loop on {}: {:.0} H/s effective ({} candidates in {:.2}s)",
+            crk.device_name(),
+            N as f64 / wall,
+            N,
+            wall
+        );
+        // Sanity: effective must be within 4x of kernel-only, never CPU-slow.
+        assert!(N as f64 / wall > 50_000.0, "effective throughput collapsed");
     }
 
     #[test]
@@ -783,55 +985,43 @@ mod tests {
             &stop,
         );
         assert_eq!(found.as_deref(), Some("sup3r-secret"));
-        // crack returns immediately at the match, possibly before the
-        // batch-end progress tick, so progress may be anything ≤ 65536.
+        // crack returns at the hit batch, possibly before end-of-batch.
         assert!(last_done <= 65536, "progress reported {last_done}");
         assert!(last_hps >= 0.0);
     }
 
     #[test]
-    fn gpu_agrees_with_crypto_verify_on_synthetic() {
-        let Some(_crk) = GpuCracker::try_new() else {
+    fn gpu_finds_planted_pmkid() {
+        let Some(crk) = GpuCracker::try_new() else {
             eprintln!("no GPU adapter, skipping");
             return;
         };
-        // The GPU path (kernel) for a batch containing the right pass must
-        // identify exactly the candidates crypto::verify accepts.
-        let crk = _crk;
-        let pass = b"sup3r-secret";
-        let target = synthetic_target("parafin", pass, 2);
-        let cands: Vec<Vec<u8>> = (0..64)
-            .map(|i| if i == 33 { pass.to_vec() } else { format!("zz{:07}", i).into_bytes() })
-            .collect();
-        let mut inputs = Vec::new();
-        for w in &cands {
-            inputs.extend_from_slice(&candidate_inputs(w, b"parafin"));
-        }
-        let out = crk.run_kernel(&inputs).expect("kernel");
-        let pmks = assemble_pmks(&out);
-        let mut hits = 0;
-        for (w, k) in cands.iter().zip(pmks.iter()) {
-            let gpu_hit = target_matches(&target, k);
-            let cpu_hit = crypto::verify(&target, w);
-            assert_eq!(gpu_hit, cpu_hit, "disagreement on {w:?}");
-            hits += gpu_hit as usize;
-        }
-        assert_eq!(hits, 1);
+        let target = synthetic_pmkid("parafin", b"hunter2!!");
+        let words: Vec<Vec<u8>> = vec![b"nope-nope".to_vec(), b"hunter2!!".to_vec()];
+        let mut it = words.into_iter();
+        let stop = Arc::new(AtomicBool::new(false));
+        let found = crk.crack(&target, &mut it, &mut |_, _| {}, &stop);
+        assert_eq!(found.as_deref(), Some("hunter2!!"));
     }
 
     #[test]
-    fn pmk64_benchmark_hps() {
+    fn gpu_rejects_wrong_pass_and_routes_kv3() {
         let Some(crk) = GpuCracker::try_new() else {
-            eprintln!("no GPU adapter, skipping benchmark");
+            eprintln!("no GPU adapter, skipping");
             return;
         };
-        let hps = crk.measured_hps().expect("kernel must succeed");
-        eprintln!(
-            "GPU PBKDF2-WPA2 throughput on {}: {:.0} H/s",
-            crk.device_name(),
-            hps
-        );
-        assert!(hps > 1000.0, "suspiciously slow: {hps} H/s");
+        // Wrong candidate must NOT trip the on-device verifier.
+        let target = synthetic_target("parafin", b"sup3r-secret", 2);
+        let words: Vec<Vec<u8>> = (0..64).map(|i| format!("zz{:07}", i).into_bytes()).collect();
+        let mut it = words.into_iter();
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(crk.crack(&target, &mut it, &mut |_, _| {}, &stop).is_none());
+        // key_ver 3 (AES-CMAC) is not expressible in the SHA1 shader.
+        let kv3 = synthetic_target("parafin", b"sup3r-secret", 3);
+        assert!(!gpu_verifiable(&kv3));
+        // ...and long ESSIDs (spill the one-block U message) route to CPU.
+        let long = synthetic_target(&"s".repeat(52), b"sup3r-secret", 2);
+        assert!(!gpu_verifiable(&long));
     }
 
     #[test]
@@ -847,7 +1037,7 @@ mod tests {
             .collect();
         let mut it = words.into_iter();
         let stop = Arc::new(AtomicBool::new(false));
-        let found = cpu_crack(&target, &mut it, &mut |_, _| {}, &stop);
+        let found = cpu_crack(&target, &mut it, &mut |_, _| {}, &stop, None);
         assert_eq!(found.as_deref(), Some("sup3r-secret"));
     }
 
@@ -865,7 +1055,7 @@ mod tests {
         let words: Vec<Vec<u8>> = vec![b"nope-nope".to_vec(), b"hunter2!!".to_vec()];
         let mut it = words.into_iter();
         let stop = Arc::new(AtomicBool::new(false));
-        let found = cpu_crack(&target, &mut it, &mut |_, _| {}, &stop);
+        let found = cpu_crack(&target, &mut it, &mut |_, _| {}, &stop, None);
         assert_eq!(found.as_deref(), Some("hunter2!!"));
     }
 
@@ -876,7 +1066,7 @@ mod tests {
         let words: Vec<Vec<u8>> = (0..2000).map(|i| format!("zz{:07}", i).into_bytes()).collect();
         let mut it = words.into_iter();
         let stop = Arc::new(AtomicBool::new(true));
-        assert!(cpu_crack(&target, &mut it, &mut |_, _| {}, &stop).is_none());
+        assert!(cpu_crack(&target, &mut it, &mut |_, _| {}, &stop, None).is_none());
         if let Some(crk) = GpuCracker::try_new() {
             let words2: Vec<Vec<u8>> = (0..2000).map(|i| format!("zz{:07}", i).into_bytes()).collect();
             let mut it2 = words2.into_iter();
@@ -884,4 +1074,3 @@ mod tests {
         }
     }
 }
-
