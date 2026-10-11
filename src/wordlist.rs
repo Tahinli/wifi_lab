@@ -29,6 +29,35 @@ impl Iterator for WordIter {
     }
 }
 
+/// Count lines without parsing: byte-scan for `\n` in 8 MiB chunks
+/// (fast even on multi-GB lists — the cracker's worst-case candidate
+/// total). A final line without trailing newline counts too.
+pub fn line_count(path: &Path) -> Result<u64> {
+    use std::io::Read;
+
+    let mut f = File::open(path)
+        .with_context(|| format!("counting lines of {}", path.display()))?;
+    let mut buf = vec![0u8; 1 << 23];
+    let mut count = 0u64;
+    let mut any = false;
+    let mut ended_with_nl = true;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("counting lines of {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        any = true;
+        ended_with_nl = buf[n - 1] == b'\n';
+        count += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+    }
+    if any && !ended_with_nl {
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Open a wordlist file as a streaming iterator of passphrase candidates.
 ///
 /// Lines are trimmed of `\r\n` only (no whitespace trimming), and only
@@ -84,5 +113,23 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         assert!(open(Path::new("/definitely/not/here.lst")).is_err());
+    }
+
+    #[test]
+    fn line_count_edges() {
+        let dir = std::env::temp_dir();
+        for (name, bytes, want) in [
+            ("empty", &b""[..], 0u64),
+            ("one-no-nl", b"abc", 1),
+            ("one-nl", b"abc\n", 1),
+            ("two", b"abc\ndef\n", 2),
+            ("trailing-nl-only", b"\n", 1),
+            ("crlf", b"a\r\nb\r\n", 2),
+        ] {
+            let path = dir.join(format!("wifilab-lc-{name}-{}", std::process::id()));
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(line_count(&path).unwrap(), want, "{name}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
