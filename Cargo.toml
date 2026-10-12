@@ -8,6 +8,7 @@ license = "MIT"
 # GPUI UI (gpuikit's pinned gpui fork)
 # gpuikit 0.9.0 predates API drift in newer gpui-unofficial builds — pin exact.
 gpui = { package = "gpui-unofficial", version = "=1.14.2" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.14.2" }
 gpuikit = "0.9.0"
 
 # GPU compute (PBKDF2-SHA1 handshake cracker)

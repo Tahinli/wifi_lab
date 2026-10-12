@@ -6878,6 +6878,7 @@ dependencies = [
  "byteorder",
  "clap",
  "crossbeam-channel",
+ "gpui-platform-gpui-unofficial",
  "gpui-unofficial",
  "gpuikit",
  "hmac 0.12.1",

@@ -174,6 +174,14 @@ pub enum Event {
     PmkidCaptured(PmkidCapture),
     /// Count of deauth/disassoc frames actually written to the wire.
     DeauthSent { ap: MacAddr, target: MacAddr, count: u64 },
+    /// Candidates checked so far (`done`) and current throughput (`hps`)
+    /// of a running crack job.
+    CrackProgress { done: u64, hps: f64 },
+    /// A crack job recovered the passphrase.
+    CrackFound { password: String },
+    /// The active crack job ended: `found` distinguishes success from
+    /// exhaustion/user-stop (emitted after [`Event::CrackFound`] too).
+    CrackStopped { found: bool },
     Log(String),
     Error(String),
 }
