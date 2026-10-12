@@ -28,13 +28,14 @@ just logs a reminder; nothing fails mid-attack.
   Not root? The badge shows it and a toast warns once — the UI stays
   usable, but every attack will fail with errors in the Log page.
 
-The tool does **not** kill or stop anything on your system. If
-NetworkManager/wpa_supplicant grab the interface (channel changes fail,
-no packets), stop them yourself, e.g.:
-
-```sh
-sudo systemctl stop NetworkManager   # optional, only if attacks misbehave
-```
+**NetworkManager fight:** while NetworkManager is active it pins the card
+to the connected network's channel — during a scan you will typically see
+**only that one SSID** (e.g. your connected network) instead of every
+neighbour. The app detects this at *Start capture*, shows a destructive
+toast, logs a warning, and offers a **"Stop NM"** button in the header
+(one click, uses the elevated session). Restore it afterwards with
+`systemctl start NetworkManager`. Everything else on the system is left
+untouched.
 
 ## Workflow
 

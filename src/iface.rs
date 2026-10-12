@@ -170,6 +170,27 @@ pub fn is_root() -> bool {
     (unsafe { libc::geteuid() }) == 0
 }
 
+/// True while NetworkManager is active — it will fight channel control and
+/// pin the card to the connected network's channel (only *that* SSID's
+/// beacons get seen). No root needed to check.
+pub fn networkmanager_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "NetworkManager"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Stop NetworkManager (and with it wpa_supplicant's radio fighting).
+/// Requires root. Restart later with `systemctl start NetworkManager`.
+pub fn stop_networkmanager() -> Result<()> {
+    run(
+        "systemctl",
+        &["stop".into(), "NetworkManager".into()],
+    )
+    .map(|_| ())
+}
+
 /// True when `pkexec` (polkit) is available for GUI privilege elevation.
 pub fn pkexec_available() -> bool {
     Command::new("pkexec")

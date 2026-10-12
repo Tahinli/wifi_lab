@@ -85,6 +85,8 @@ pub struct AppRoot {
     /// flight. 0 = waiting on the polkit dialog, 1 = elevated instance
     /// launched (quit this one), 2 = declined/failed (message was logged).
     pub elevation: Option<Arc<AtomicU8>>,
+    /// NetworkManager seen active when capture started (fights channels).
+    pub nm_active: bool,
     /// Used to invalidate stale cracker simulation ticks after Stop/re-Start.
     pub crack_epoch: u64,
     pub ap_sort: Option<SortDescriptor>,
@@ -158,6 +160,7 @@ impl AppRoot {
             crack_inflight: false,
             pending_toast: None,
             elevation: None,
+            nm_active: false,
             crack_epoch: 0,
             ap_sort: None,
             client_sort: None,
@@ -247,10 +250,26 @@ impl AppRoot {
         } else {
             if !self.is_root {
                 self.state.push_log(
-                    "ui: capture needs root — click \"Elevate via polkit\" in the header first".to_string(),
+                    "ui: capture REFUSED — no root privileges. Elevate via polkit first.".to_string(),
+                );
+                self.pending_toast = Some(
+                    "ELEVATION REQUIRED: click \"Elevate via polkit\" in the header before starting capture".into(),
                 );
                 cx.notify();
                 return;
+            }
+            // NetworkManager fight: pin-to-connected-channel makes ONLY the
+            // associated network (e.g. parafin) visible during the hop.
+            if crate::iface::networkmanager_active() {
+                self.nm_active = true;
+                self.state.push_log(
+                    "ui: WARNING NetworkManager is active — it pins the card to the connected \
+                     network's channel; you will likely see ONLY that SSID. Use \"Stop NM\" in the header."
+                        .to_string(),
+                );
+                self.pending_toast = Some(
+                    "NetworkManager is active — only your connected network may be visible; stop it from the header".into(),
+                );
             }
             let ifname = self.state.ifname.clone();
             match Backend::start_scan(&ifname, self.tx.clone()) {
@@ -267,6 +286,27 @@ impl AppRoot {
             }
             cx.notify();
         }
+    }
+
+    /// Stop NetworkManager (root) so it stops pinning the radio to the
+    /// connected network's channel.
+    pub fn stop_nm(&mut self, cx: &mut Context<Self>) {
+        match crate::iface::stop_networkmanager() {
+            Ok(()) => {
+                self.nm_active = false;
+                self.state.push_log(
+                    "ui: NetworkManager stopped — channel hopping is now exclusive; restart it later with `systemctl start NetworkManager`"
+                        .to_string(),
+                );
+                self.pending_toast =
+                    Some("NetworkManager stopped — all networks become visible as the hopper cycles".into());
+            }
+            Err(e) => {
+                self.state
+                    .push_log(format!("ERROR stopping NetworkManager: {e:#}"));
+            }
+        }
+        cx.notify();
     }
 
     /// Re-exec this app as root via polkit (pkexec). The polkit dialog is
@@ -487,6 +527,17 @@ impl AppRoot {
             }
         });
 
+        let nm_badge = (self.nm_active && !self.is_mock)
+            .then(|| badge("NM active — channels pinned").destructive());
+        let nm_btn = (self.nm_active && self.is_root && !self.is_mock).then(|| {
+            button("stop-nm", "Stop NM").on_click({
+                let view = view.clone();
+                move |_, _window, cx| {
+                    view.update(cx, |app, cx| app.stop_nm(cx));
+                }
+            })
+        });
+
         h_stack()
             .w_full()
             .px_4()
@@ -500,6 +551,8 @@ impl AppRoot {
             .child(privilege)
             .children(elevate_btn)
             .child(div().w(px(220.)).child(self.iface_select.clone()))
+            .children(nm_badge)
+            .children(nm_btn)
             .child(toggle)
             .child(div().flex_1())
             .child(
