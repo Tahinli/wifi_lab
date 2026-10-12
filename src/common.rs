@@ -214,6 +214,31 @@ pub enum Event {
 pub const HOP_CHANNELS_24: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 pub const HOP_CHANNELS_5: &[u8] = &[36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128];
 
+/// 2.4 GHz channel → carrier frequency (MHz).
+pub fn freq_of_channel(ch: u8) -> Option<u16> {
+    match ch {
+        1..=13 => Some(2407 + 5 * ch as u16),
+        14 => Some(2484),
+        36..=173 => Some(5000 + 5 * ch as u16),
+        _ => None,
+    }
+}
+
+/// Default hop list as FREQUENCIES (MHz): every 2.4 GHz channel, the full
+/// TR-legal 5 GHz span (incl. 132/136/140 which plain channel lists often
+/// miss), and the 6 GHz PSC channels (6, 22, 38, 54, 70, 86 =
+/// 5980/6060/6140/6220/6300/6380 MHz) — phone hotspots increasingly land
+/// on 6 GHz and are invisible to channel-lists that omit it.
+pub const HOP_FREQS_ALL: &[u16] = &[
+    // 2.4 GHz ch 1..13
+    2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+    // 5 GHz ch 36..64 and 100..140
+    5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620,
+    5640, 5660, 5680, 5700,
+    // 6 GHz PSC
+    5980, 6060, 6140, 6220, 6300, 6380,
+];
+
 /// Commands the UI process sends to the privileged service
 /// (`--privileged-worker` child), serialized as one `serde_json` line each
 /// on the child's stdin.

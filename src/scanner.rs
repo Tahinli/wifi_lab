@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 
-use crate::common::{
-    AccessPoint, ClientInfo, Event, HOP_CHANNELS_24, HOP_CHANNELS_5, MacAddr, now_ms,
-};
+use crate::common::{AccessPoint, ClientInfo, Event, HOP_FREQS_ALL, MacAddr, now_ms};
 use crate::radiotap::RxMeta;
 use crate::rawsock::RawSocket;
 use crate::{dot11, iface, radiotap};
@@ -27,8 +25,9 @@ const CLIENT_EXPIRE_MS: u64 = 60_000;
 
 pub struct ScannerConfig {
     pub ifname: String,
-    /// Channels to hop; empty = all 2.4 + 5 GHz hop channels.
-    pub channels: Vec<u8>,
+    /// Carrier frequencies (MHz) to hop; empty = [`HOP_FREQS_ALL`]
+    /// (2.4 GHz, full TR-legal 5 GHz span, 6 GHz PSC).
+    pub freqs: Vec<u16>,
     /// Dwell per channel.
     pub dwell_ms: u32,
     /// RSSI below this blocks creation of new AP/client entries (updates to
@@ -44,6 +43,9 @@ fn freq_to_channel(freq_mhz: u16) -> Option<u8> {
         2484 => Some(14),
         // 5 GHz: ch = (freq - 5000) / 5.
         5000..=5900 => Some(((freq_mhz - 5000) / 5) as u8),
+        // 6 GHz: ch = (freq - 5950) / 5 (collides numerically with 2.4 GHz;
+        // display-only usage here).
+        5945..=6425 => Some(((freq_mhz - 5950) / 5) as u8),
         _ => None,
     }
 }
@@ -235,18 +237,14 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
         .with_context(|| format!("opening {} for scan", cfg.ifname))?;
     sock.set_timeout(cfg.dwell_ms).context("set_timeout")?;
 
-    let channels: Vec<u8> = if cfg.channels.is_empty() {
-        HOP_CHANNELS_24
-            .iter()
-            .chain(HOP_CHANNELS_5.iter())
-            .copied()
-            .collect()
+    let freqs: Vec<u16> = if cfg.freqs.is_empty() {
+        HOP_FREQS_ALL.to_vec()
     } else {
-        cfg.channels.clone()
+        cfg.freqs.clone()
     };
     let _ = tx.send(Event::Log(format!(
-        "scanner: {} channels, {} ms dwell on {}",
-        channels.len(),
+        "scanner: {} freqs, {} ms dwell on {}",
+        freqs.len(),
         cfg.dwell_ms,
         cfg.ifname
     )));
@@ -258,12 +256,14 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
     let mut last_stats_log = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        let ch = channels[ch_idx];
-        let cur_ch = ch;
-        ch_idx = (ch_idx + 1) % channels.len();
-        if let Err(e) = iface::set_channel(&cfg.ifname, ch) {
+        let freq = freqs[ch_idx];
+        // Display channel number (2.4/5 GHz exact; 6 GHz reported as its
+        // own channel number — cosmetic only).
+        let cur_ch = freq_to_channel(freq).map(|c| c as i32).unwrap_or(-1);
+        ch_idx = (ch_idx + 1) % freqs.len();
+        if let Err(e) = iface::set_freq(&cfg.ifname, freq) {
             let _ = tx.send(Event::Log(format!(
-                "scanner: hop to ch {ch} failed: {e:#}"
+                "scanner: hop to {freq} MHz failed: {e:#}"
             )));
         }
 

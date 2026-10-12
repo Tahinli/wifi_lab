@@ -115,6 +115,21 @@ pub fn set_channel(ifname: &str, ch: u8) -> Result<()> {
     }
 }
 
+/// Tune by carrier frequency — the only unambiguous way once 6 GHz enters
+/// (6 GHz channel numbers collide with 2.4 GHz in `iw set channel`).
+pub fn set_freq(ifname: &str, freq_mhz: u16) -> Result<()> {
+    let f = freq_mhz.to_string();
+    match iw(&["dev", ifname, "set", "freq", &f]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            iw(&["dev", ifname, "set", "freq", &f])
+                .map(|_| ())
+                .with_context(|| format!("set freq {f} on {ifname} after retry: {e:#}"))
+        }
+    }
+}
+
 /// Parse `iw dev <ifname> info` for the current channel.
 /// Err if not determinable.
 pub fn current_channel(ifname: &str) -> Result<u8> {

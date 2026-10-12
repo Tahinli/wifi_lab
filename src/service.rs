@@ -116,9 +116,15 @@ impl RadioService {
         self.mon_ifname = Some(mon_ifname.clone());
         log(&self.tx, format!("monitor mode up on {mon_ifname} (was {ifname})"));
 
+        // Parked-diagnostic channel numbers (2.4/5 GHz) map to frequencies;
+        // empty = full default hop list incl. 6 GHz PSC.
+        let freqs: Vec<u16> = channels
+            .iter()
+            .filter_map(|&ch| crate::common::freq_of_channel(ch))
+            .collect();
         let cfg = scanner::ScannerConfig {
             ifname: mon_ifname,
-            channels: channels.to_vec(), // empty = full hop list
+            freqs,
             dwell_ms: 100,
             rssi_floor: -95,
         };
