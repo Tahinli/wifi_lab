@@ -44,60 +44,67 @@ fn iface_exists(ifname: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Bring the link down, switch ifname to monitor mode, bring it up.
+/// Enter monitor mode by creating a DEDICATED monitor vif `<ifname>mon`
+/// and bringing the original STA vif DOWN.
 ///
-/// On drivers that cannot switch type in place, falls back to creating a
-/// separate `<ifname>mon` monitor interface. Idempotent.
+/// Why never switch type in place: on iwlwifi (verified on this lab box,
+/// AX-class) a STA vif that has ever been associated drags a firmware
+/// channel-context with it into monitor type — `iw set channel`/`set freq`
+/// succeed at the cfg80211 level, `iw dev info` shows the new channel, yet
+/// the RX path demonstrably stays pinned to the old association channel
+/// (only that AP's frames ever arrive). A freshly created monitor vif has
+/// no such context and receives everything, with the STA vif merely down.
+/// Bringing the STA vif down also releases the channel context, so the
+/// original interface survives (no `iw dev del`).
 ///
-/// Returns the name of the interface that is now in monitor mode — either
-/// `ifname` itself or the created `<ifname>mon`. Callers must pass the
-/// returned name to channel-setting, sockets and `to_managed`.
+/// Idempotent. Returns the monitor vif name (`<ifname>mon`). Callers pass
+/// the returned name to channel-setting and sockets, and call
+/// [`teardown_monitor`] with the ORIGINAL ifname to restore.
 pub fn to_monitor(ifname: &str) -> Result<String> {
+    let mon = monitor_name(ifname);
+    // STA down first: releases any channel context the association held.
     ip(&["link", "set", ifname, "down"])?;
-    match iw(&["dev", ifname, "set", "type", "monitor"]) {
-        Ok(_) => {
-            ip(&["link", "set", ifname, "up"])?;
-            Ok(ifname.to_string())
-        }
-        Err(e) => {
-            // Fallback: add a dedicated monitor vif named `<ifname>mon`.
-            let mon = format!("{ifname}mon");
-            iw(&[
-                "dev",
-                ifname,
-                "interface",
-                "add",
-                &mon,
-                "type",
-                "monitor",
-            ])
-            .with_context(|| format!("monitor fallback after: {e:#}"))?;
-            ip(&["link", "set", &mon, "up"])?;
-            // Bring the parent back up as well so the driver stays happy.
-            let _ = ip(&["link", "set", ifname, "up"]);
-            Ok(mon)
-        }
+    if !iface_exists(&mon) {
+        let phy = phy_of(ifname)?;
+        iw(&[
+            "phy", &phy, "interface", "add", &mon, "type", "monitor",
+        ])
+        .with_context(|| format!("adding monitor vif {mon} on {phy}"))?;
     }
+    ip(&["link", "set", &mon, "up"])?;
+    Ok(mon)
 }
 
-/// Reverse `to_monitor`: when `ifname` is a `<base>mon` vif that `to_monitor`
-/// created via interface-add (probed through `iw dev`: base present too),
-/// delete it; otherwise switch the interface itself back to managed mode.
-pub fn to_managed(ifname: &str) -> Result<()> {
-    let added_vif = ifname
-        .strip_suffix("mon")
-        .filter(|base| !base.is_empty())
-        .map(|base| iface_exists(ifname) && iface_exists(base) && base != ifname)
-        .unwrap_or(false);
-    if added_vif {
-        iw(&["dev", ifname, "del"])?;
-        return Ok(());
+/// Reverse [`to_monitor`]: delete the monitor vif if present and bring the
+/// original interface back up (it never left managed type). Idempotent.
+pub fn teardown_monitor(ifname: &str) -> Result<()> {
+    let mon = monitor_name(ifname);
+    if iface_exists(&mon) {
+        let _ = ip(&["link", "set", &mon, "down"]);
+        iw(&["dev", &mon, "del"])?;
     }
-    ip(&["link", "set", ifname, "down"])?;
-    iw(&["dev", ifname, "set", "type", "managed"])
-        .or_else(|_| iw(&["dev", ifname, "set", "type", "station"]))?;
-    ip(&["link", "set", ifname, "up"])?;
+    if iface_exists(ifname) {
+        ip(&["link", "set", ifname, "up"])?;
+    }
     Ok(())
+}
+
+/// Monitor vif name convention — single source of truth.
+pub fn monitor_name(ifname: &str) -> String {
+    format!("{ifname}mon")
+}
+
+/// Resolve the wiphy name (e.g. "phy0") that owns `ifname` via sysfs.
+fn phy_of(ifname: &str) -> Result<String> {
+    let link = format!("/sys/class/net/{ifname}/phy80211");
+    let target = std::fs::read_link(&link)
+        .with_context(|| format!("reading {link} — is {ifname} wireless?"))?;
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .with_context(|| format!("resolving phy name for {ifname}"))?;
+    Ok(name)
 }
 
 /// Tune the interface to channel `ch` (one retry — some drivers drop the

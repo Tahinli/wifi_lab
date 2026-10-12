@@ -108,7 +108,7 @@ impl RadioService {
             Err(e) => {
                 log_err(&self.tx, format!("monitor mode on {ifname} failed: {e:#}"));
                 // Best effort: leave the box the way we found it.
-                let _ = iface::to_managed(ifname);
+                let _ = iface::teardown_monitor(ifname);
                 self.orig_ifname = None;
                 return;
             }
@@ -142,8 +142,10 @@ impl RadioService {
                 log_err(&self.tx, format!("scanner: spawn failed: {e}"));
                 // Leave the UI consistent: nothing runs but the interface
                 // is in monitor mode — flip it back.
-                if let Some(mon) = self.mon_ifname.take() {
-                    let _ = iface::to_managed(&mon);
+                if self.mon_ifname.take().is_some() {
+                    if let Some(orig) = &self.orig_ifname {
+                        let _ = iface::teardown_monitor(orig);
+                    }
                 }
             }
         }
@@ -157,12 +159,13 @@ impl RadioService {
         for h in handles {
             let _ = h.join();
         }
-        if let Some(mon) = self.mon_ifname.take() {
-            if let Err(e) = iface::to_managed(&mon) {
-                eprintln!("wifilab-svc: to_managed({mon}) failed: {e:#}");
+        if let Some(orig) = self.orig_ifname.take() {
+            if self.mon_ifname.take().is_some() {
+                if let Err(e) = iface::teardown_monitor(&orig) {
+                    eprintln!("wifilab-svc: teardown_monitor({orig}) failed: {e:#}");
+                }
             }
         }
-        self.orig_ifname = None;
     }
 
     /// Register a worker thread; on spawn failure the error is reported on
