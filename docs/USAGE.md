@@ -5,12 +5,19 @@ crack it on the GPU (CPU fallback). Single binary, GPUI shell.
 
 ## Running
 
-The real backend is the default and requires root:
+No terminal privileges needed. Start the app normally:
 
 ```sh
 cargo build --release
-sudo ./target/release/wifilab --iface wlp14s0
+./target/release/wifilab
 ```
+
+Privileges are handled **inside the UI**: when not running as root the
+header shows a **"Elevate via polkit"** button — one click pops the
+system polkit dialog, and the app restarts itself elevated (same window,
+same selected interface). The unprivileged window closes automatically
+once the elevated instance is up. Starting a capture while unprivileged
+just logs a reminder; nothing fails mid-attack.
 
 - `--iface <name>` picks the wireless interface (default: first detected
   wireless interface, falling back to `wlp14s0`). The header bar's picker

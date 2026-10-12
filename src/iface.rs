@@ -170,6 +170,47 @@ pub fn is_root() -> bool {
     (unsafe { libc::geteuid() }) == 0
 }
 
+/// True when `pkexec` (polkit) is available for GUI privilege elevation.
+pub fn pkexec_available() -> bool {
+    Command::new("pkexec")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Re-exec this binary via polkit (`pkexec`) as root, preserving the desktop
+/// session environment so the elevated instance can open its own window.
+///
+/// Blocks until `pkexec` returns. A dismissed/cancelled authentication
+/// dialog surfaces as a non-zero exit status (126/127). MUST be called off
+/// the UI thread.
+pub fn relaunch_elevated(extra_args: &[&str]) -> Result<std::process::ExitStatus> {
+    let exe = std::env::current_exe().context("resolving current_exe for pkexec re-exec")?;
+    let mut cmd = Command::new("pkexec");
+    cmd.arg("env");
+    // GUI + session bus env the elevated child needs to open a window and
+    // talk to the user's services (GPU/DRI inherits via the session).
+    for var in [
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XAUTHORITY",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            cmd.arg(format!("{var}={v}"));
+        }
+    }
+    cmd.arg(exe).args(extra_args);
+    let status = cmd
+        .status()
+        .context("spawning pkexec — polkit not installed or no agent running")?;
+    Ok(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

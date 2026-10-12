@@ -51,7 +51,7 @@ fn main() {
         } else if iface::is_root() {
             "monitor mode + injection available"
         } else {
-            "WARNING: not root, monitor mode and injection will fail (run with sudo)"
+            "not root — use the \"Elevate via polkit\" button in the UI header"
         }
     );
     ui::run_app(cli.iface, cli.mock);

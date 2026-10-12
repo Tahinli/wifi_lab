@@ -3,6 +3,8 @@
 //! task that polls the backend event channel.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -79,6 +81,10 @@ pub struct AppRoot {
     /// Toast queued by the event loop (no Window there) — shown on the
     /// next render pass.
     pub pending_toast: Option<SharedString>,
+    /// Elevate-via-polkit handshake: Some while a pkexec re-exec is in
+    /// flight. 0 = waiting on the polkit dialog, 1 = elevated instance
+    /// launched (quit this one), 2 = declined/failed (message was logged).
+    pub elevation: Option<Arc<AtomicU8>>,
     /// Used to invalidate stale cracker simulation ticks after Stop/re-Start.
     pub crack_epoch: u64,
     pub ap_sort: Option<SortDescriptor>,
@@ -151,6 +157,7 @@ impl AppRoot {
             attacking_pmkid: false,
             crack_inflight: false,
             pending_toast: None,
+            elevation: None,
             crack_epoch: 0,
             ap_sort: None,
             client_sort: None,
@@ -181,9 +188,14 @@ impl AppRoot {
         })
         .detach();
 
-        if !this.is_root {
-            cx.toast("not root: monitor mode and injection will fail — run with sudo")
-                .show(window, cx);
+        if !this.is_root && !this.is_mock {
+            if crate::iface::pkexec_available() {
+                cx.toast("not root — click \"Elevate via polkit\" in the header to gain privileges")
+                    .show(window, cx);
+            } else {
+                cx.toast("not root and polkit (pkexec) unavailable — monitor mode and injection will fail")
+                    .show(window, cx);
+            }
         }
 
         // Poll the backend event channel: wait on the background executor,
@@ -233,6 +245,13 @@ impl AppRoot {
             self.state.push_log("ui: capture stopped, interface restored");
             cx.notify();
         } else {
+            if !self.is_root {
+                self.state.push_log(
+                    "ui: capture needs root — click \"Elevate via polkit\" in the header first".to_string(),
+                );
+                cx.notify();
+                return;
+            }
             let ifname = self.state.ifname.clone();
             match Backend::start_scan(&ifname, self.tx.clone()) {
                 Ok(be) => {
@@ -250,9 +269,61 @@ impl AppRoot {
         }
     }
 
+    /// Re-exec this app as root via polkit (pkexec). The polkit dialog is
+    /// fully OS-driven; on success the elevated instance opens its own
+    /// window and this one closes itself.
+    pub fn elevate(&mut self, cx: &mut Context<Self>) {
+        if self.is_root || self.is_mock || self.elevation.is_some() {
+            return;
+        }
+        if self.backend.is_some() {
+            self.state.push_log("ui: stop capture before elevating");
+            cx.notify();
+            return;
+        }
+        let flag = Arc::new(AtomicU8::new(0));
+        self.elevation = Some(flag.clone());
+        let ifname = self.state.ifname.clone();
+        let tx = self.tx.clone();
+        self.state.push_log(format!(
+            "ui: requesting administrative privileges via polkit (restarting elevated on {ifname})…"
+        ));
+        cx.notify();
+        std::thread::spawn(move || {
+            match crate::iface::relaunch_elevated(&["--iface", ifname.as_str()]) {
+                Ok(st) if st.success() => flag.store(1, Ordering::SeqCst),
+                Ok(st) => {
+                    flag.store(2, Ordering::SeqCst);
+                    let _ = tx.send(Event::Log(format!(
+                        "ui: elevation dialog dismissed or failed (pkexec exit {st})"
+                    )));
+                }
+                Err(e) => {
+                    flag.store(2, Ordering::SeqCst);
+                    let _ = tx.send(Event::Error(format!("polkit elevation failed: {e:#}")));
+                }
+            }
+        });
+    }
+
     /// Drain every queued event, track handshake progress, refresh widgets
     /// derived from the capture set.
     fn drain_events(&mut self, cx: &mut Context<Self>) {
+        // Elevation handshake: success → the new elevated window is up,
+        // close this one; failure → allow retry (message already queued).
+        if let Some(flag) = &self.elevation {
+            match flag.load(Ordering::SeqCst) {
+                1 => {
+                    self.state
+                        .push_log("ui: elevated instance started — closing this window");
+                    self.elevation = None;
+                    cx.quit();
+                    return;
+                }
+                2 => self.elevation = None,
+                _ => {}
+            }
+        }
         let mut changed = false;
         let mut captures_changed = false;
         while let Ok(event) = self.rx.try_recv() {
@@ -370,9 +441,31 @@ impl AppRoot {
 
         let privilege = if self.is_root {
             badge("root").secondary()
+        } else if self.is_mock {
+            badge("not root (mock)").secondary()
         } else {
-            badge("not root — attacks need sudo").destructive()
+            badge("not root — elevate to attack").destructive()
         };
+
+        let elevate_btn = (!self.is_root && !self.is_mock && crate::iface::pkexec_available())
+            .then(|| {
+                let waiting = self.elevation.is_some();
+                button(
+                    "elevate-btn",
+                    if waiting {
+                        "waiting for polkit…"
+                    } else {
+                        "Elevate via polkit"
+                    },
+                )
+                .disabled(waiting)
+                .on_click({
+                    let view = view.clone();
+                    move |_, _window, cx| {
+                        view.update(cx, |app, cx| app.elevate(cx));
+                    }
+                })
+            });
 
         let toggle = button(
             "monitor-toggle",
@@ -405,6 +498,7 @@ impl AppRoot {
             .bg(theme.surface())
             .child(div().text_lg().font_weight(FontWeight::BOLD).child("wifilab"))
             .child(privilege)
+            .children(elevate_btn)
             .child(div().w(px(220.)).child(self.iface_select.clone()))
             .child(toggle)
             .child(div().flex_1())
