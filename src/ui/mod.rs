@@ -1,9 +1,8 @@
 //! GPUI + gpuikit shell for wifilab.
 //!
-//! `run_app` opens the window and wires the backend event channel. Today the
-//! producer is the mock generator in [`mock`]; when the real
-//! radiotap/dot11/scanner/attack/cracker threads land they take over the
-//! `Sender` side and the UI changes nowhere else.
+//! `run_app` opens the window and wires the service event channel: the mock
+//! generator in [`mock`] (mock mode) or the privileged-service reader thread
+//! feed the `Sender` side; the UI itself never needs root.
 
 mod app;
 mod attacks;
@@ -23,8 +22,9 @@ use gpuikit::theme::{GlobalTheme, Theme};
 /// Launch the UI. Blocks until the window closes.
 ///
 /// `mock_flag` is the CLI `--mock` switch; combined with the legacy
-/// `WIFILAB_MOCK` env var. The REAL backend is the default: `Backend` is
-/// created lazily on the first "Start capture" click.
+/// `WIFILAB_MOCK` env var. The REAL service is the default: the
+/// [`crate::service::ServiceClient`] spawns lazily on the first
+/// "Start capture" click (polkit-elevated child process).
 pub fn run_app(iface: Option<String>, mock_flag: bool) {
     let (tx, rx) = crossbeam_channel::unbounded();
 

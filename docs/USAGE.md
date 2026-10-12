@@ -12,12 +12,16 @@ cargo build --release
 ./target/release/wifilab
 ```
 
-Privileges are handled **inside the UI**: when not running as root the
-header shows a **"Elevate via polkit"** button — one click pops the
-system polkit dialog, and the app restarts itself elevated (same window,
-same selected interface). The unprivileged window closes automatically
-once the elevated instance is up. Starting a capture while unprivileged
-just logs a reminder; nothing fails mid-attack.
+Privileges are handled by a **privileged service**: the UI itself never
+needs root and never respawns. The first time you click **Start capture**
+the app spawns the same binary as a child process with the hidden flag
+`--privileged-worker` — directly when already root, otherwise through
+`pkexec`, which pops the system polkit dialog **once per capture
+session**. All radio work (monitor mode, scanning, deauth, PMKID grab,
+handshake capture) happens inside that service; the two halves talk JSON
+lines over the child's stdin/stdout and only distilled events cross the
+pipe. The GPU cracker needs no privilege and runs as a plain thread in
+the UI process.
 
 - `--iface <name>` picks the wireless interface (default: first detected
   wireless interface, falling back to `wlp14s0`). The header bar's picker
@@ -25,17 +29,19 @@ just logs a reminder; nothing fails mid-attack.
 - `--mock` (or `WIFILAB_MOCK=1`) runs the UI against fabricated events —
   no device access, for development only.
 - On startup the tool prints one line: mode, interface, root status.
-  Not root? The badge shows it and a toast warns once — the UI stays
-  usable, but every attack will fail with errors in the Log page.
+  Not root? The badge says *user (service will elevate)* and a toast
+  notes polkit will ask when capture starts — the UI stays fully usable.
+  A dismissed polkit dialog just logs an error; click Start again to
+  retry.
 
 **NetworkManager fight:** while NetworkManager is active it pins the card
 to the connected network's channel — during a scan you will typically see
 **only that one SSID** (e.g. your connected network) instead of every
 neighbour. The app detects this at *Start capture*, shows a destructive
 toast, logs a warning, and offers a **"Stop NM"** button in the header
-(one click, uses the elevated session). Restore it afterwards with
-`systemctl start NetworkManager`. Everything else on the system is left
-untouched.
+(the request runs inside the elevated service). Restore it afterwards
+with `systemctl start NetworkManager`. Everything else on the system is
+left untouched.
 
 ## Workflow
 
@@ -62,13 +68,17 @@ untouched.
    point the wordlist field at e.g. `/usr/share/wordlists/rockyou.txt`,
    hit **Start**. Live H/s and candidate count stream in. **Stop** flips
    the job's stop flag and the worker exits at the next batch.
-5. Everything the backend does is mirrored on the **Log** page, including
-   worker errors (permissions, channel-change failures, wordlist open
-   failures).
+5. Everything the service (and the crack thread) does is mirrored on the
+   **Log** page, including worker errors (permissions, channel-change
+   failures, wordlist open failures). During a scan a compact
+   `scan: N rx frames, M beacons -> K APs live (ch C)` heartbeat lands
+   every 10 s — the evidence line distinguishing RX-silence from parser
+   drops.
 
-On exit (window close) all workers are stopped and the interface is
-restored to managed mode (the `<iface>mon` vif is deleted if one was
-created).
+On exit (window close) the service is told to shut down: it stops all
+radio workers, restores the interface to managed mode (deleting the
+`<iface>mon` vif if one was created), and exits; the UI-side crack
+thread is stopped as well.
 
 ## Cracking backends
 

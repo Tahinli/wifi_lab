@@ -1,8 +1,6 @@
 //! Networks page: sortable AP table, clients table, row-click target
 //! selection.
 
-use std::time::Instant;
-
 use gpui::{Context, Entity, IntoElement, ParentElement, Styled, Window, div, px};
 use gpuikit::elements::badge::badge;
 use gpuikit::elements::table::{CellAlign, Column, Row, SortDirection, Table, table};
@@ -26,9 +24,10 @@ const CCOL_RSSI: usize = 2;
 const CCOL_FRAMES: usize = 3;
 const CCOL_AGE: usize = 4;
 
-/// Human "last seen" age, e.g. `2s`, `5m`, `1h`.
-pub fn age(last_seen: Instant) -> String {
-    let s = last_seen.elapsed().as_secs();
+/// Human "last seen" age, e.g. `2s`, `5m`, `1h`. `last_seen_ms` comes from
+/// the UI/service-side process-local clock ([`crate::common::now_ms`]).
+pub fn age(last_seen_ms: u64) -> String {
+    let s = crate::common::now_ms().saturating_sub(last_seen_ms) / 1000;
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {
@@ -57,7 +56,7 @@ fn sorted_aps(app: &AppRoot) -> Vec<AccessPoint> {
             COL_SEC => l.security.label().cmp(r.security.label()),
             COL_RSSI => l.rssi_dbm.cmp(&r.rssi_dbm),
             COL_BEACONS => l.beacons.cmp(&r.beacons),
-            COL_AGE => l.last_seen.cmp(&r.last_seen).reverse(), // newest = 0s first
+            COL_AGE => l.last_seen_ms.cmp(&r.last_seen_ms).reverse(), // newest = 0s first
             _ => std::cmp::Ordering::Equal,
         };
         rows.sort_by(|l, r| match sort.direction {
@@ -76,7 +75,7 @@ fn sorted_clients(app: &AppRoot) -> Vec<ClientInfo> {
             CCOL_AP => l.ap.cmp(&r.ap),
             CCOL_RSSI => l.rssi_dbm.cmp(&r.rssi_dbm),
             CCOL_FRAMES => l.frames.cmp(&r.frames),
-            CCOL_AGE => l.last_seen.cmp(&r.last_seen).reverse(),
+            CCOL_AGE => l.last_seen_ms.cmp(&r.last_seen_ms).reverse(),
             _ => std::cmp::Ordering::Equal,
         };
         rows.sort_by(|l, r| match sort.direction {
@@ -159,7 +158,7 @@ fn ap_table(app: &AppRoot, view: &Entity<AppRoot>) -> Table<AccessPoint> {
         )
         .column(
             Column::new("AGE", |ap: &AccessPoint, _w, _cx| {
-                div().child(age(ap.last_seen)).into_any_element()
+                div().child(age(ap.last_seen_ms)).into_any_element()
             })
             .sortable()
             .fixed(px(70.))
@@ -246,7 +245,7 @@ fn client_table(app: &AppRoot, view: &Entity<AppRoot>) -> Table<ClientInfo> {
         )
         .column(
             Column::new("AGE", |cl: &ClientInfo, _w, _cx| {
-                div().child(age(cl.last_seen)).into_any_element()
+                div().child(age(cl.last_seen_ms)).into_any_element()
             })
             .sortable()
             .fixed(px(70.))

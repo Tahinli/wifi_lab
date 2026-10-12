@@ -7,19 +7,23 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+// `Instant` is still used for dwell timing; timestamps going into shared
+// types are `u64` millis (`crate::common::now_ms`) so they serialize.
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 
-use crate::common::{AccessPoint, ClientInfo, Event, HOP_CHANNELS_24, HOP_CHANNELS_5, MacAddr};
+use crate::common::{
+    AccessPoint, ClientInfo, Event, HOP_CHANNELS_24, HOP_CHANNELS_5, MacAddr, now_ms,
+};
 use crate::radiotap::RxMeta;
 use crate::rawsock::RawSocket;
 use crate::{dot11, iface, radiotap};
 
-/// APs go stale (ApLost) after this much silence.
-const AP_EXPIRE: Duration = Duration::from_secs(30);
-/// Clients go stale after this much silence.
-const CLIENT_EXPIRE: Duration = Duration::from_secs(60);
+/// APs go stale (ApLost) after this much silence (ms — `last_seen_ms`).
+const AP_EXPIRE_MS: u64 = 30_000;
+/// Clients go stale after this much silence (ms).
+const CLIENT_EXPIRE_MS: u64 = 60_000;
 
 pub struct ScannerConfig {
     pub ifname: String,
@@ -61,8 +65,9 @@ impl Scanner {
     }
 
     /// Feed one received frame. Radiotap metadata in `meta`, 802.11 bytes in
-    /// `frame` (already stripped), wall clock in `now` (test-injectable).
-    fn ingest(&mut self, meta: &RxMeta, frame: &[u8], now: Instant, tx: &Sender<Event>) {
+    /// `frame` (already stripped), clock in `now` ms since the process-local
+    /// epoch ([`common::now_ms`], test-injectable).
+    fn ingest(&mut self, meta: &RxMeta, frame: &[u8], now: u64, tx: &Sender<Event>) {
         // AP from beacon / probe-response.
         if let Some(m) = dot11::parse_beacon_or_probe(frame) {
             // Trust the DS-parameter IE; fall back to the radiotap carrier
@@ -92,7 +97,7 @@ impl Scanner {
                         changed = true;
                     }
                     ap.beacons += 1;
-                    ap.last_seen = now;
+                    ap.last_seen_ms = now;
                     if changed {
                         let _ = tx.send(Event::ApUpdated(ap.clone()));
                     }
@@ -108,7 +113,7 @@ impl Scanner {
                         security: m.security,
                         rssi_dbm: meta.rssi_dbm,
                         beacons: 1,
-                        last_seen: now,
+                        last_seen_ms: now,
                     };
                     self.aps.insert(m.bssid, ap.clone());
                     let _ = tx.send(Event::ApUpdated(ap));
@@ -133,7 +138,7 @@ impl Scanner {
                 self.note_client(sta, Some(bssid), meta, now, tx);
             }
             if let Some(ap) = self.aps.get_mut(&bssid) {
-                ap.last_seen = now;
+                ap.last_seen_ms = now;
             }
         }
     }
@@ -143,7 +148,7 @@ impl Scanner {
         sta: MacAddr,
         ap: Option<MacAddr>,
         meta: &RxMeta,
-        now: Instant,
+        now: u64,
         tx: &Sender<Event>,
     ) {
         match self.clients.get_mut(&sta) {
@@ -160,7 +165,7 @@ impl Scanner {
                     }
                 }
                 c.frames += 1;
-                c.last_seen = now;
+                c.last_seen_ms = now;
                 if changed {
                     let _ = tx.send(Event::ClientUpdated(c.clone()));
                 }
@@ -174,7 +179,7 @@ impl Scanner {
                     ap,
                     rssi_dbm: meta.rssi_dbm,
                     frames: 1,
-                    last_seen: now,
+                    last_seen_ms: now,
                 };
                 self.clients.insert(sta, c.clone());
                 let _ = tx.send(Event::ClientUpdated(c));
@@ -184,11 +189,11 @@ impl Scanner {
 
     /// Expire silent entries, emitting ApLost / (clients just drop out —
     /// contract has no ClientLost event; stale clients stop being updated).
-    fn expire(&mut self, now: Instant, tx: &Sender<Event>) {
+    fn expire(&mut self, now: u64, tx: &Sender<Event>) {
         let gone: Vec<MacAddr> = self
             .aps
             .iter()
-            .filter(|(_, ap)| now.duration_since(ap.last_seen) > AP_EXPIRE)
+            .filter(|(_, ap)| now.saturating_sub(ap.last_seen_ms) > AP_EXPIRE_MS)
             .map(|(b, _)| *b)
             .collect();
         for b in gone {
@@ -196,8 +201,25 @@ impl Scanner {
             let _ = tx.send(Event::ApLost(b));
         }
         self.clients
-            .retain(|_, c| now.duration_since(c.last_seen) <= CLIENT_EXPIRE);
+            .retain(|_, c| now.saturating_sub(c.last_seen_ms) <= CLIENT_EXPIRE_MS);
     }
+}
+
+/// Wall-clock counters for the 10 s `scan: …` diagnostic line — the evidence
+/// channel distinguishing RX-silence from parser-drops when "only my own AP
+/// shows up" is reported.
+#[derive(Default)]
+struct ScanStats {
+    /// Frames returned by `RawSocket::recv` (radiotap included, unparsed).
+    raw_frames_received: u64,
+    /// Frames whose radiotap header parsed (`radiotap::strip` returned Some).
+    radiotap_strip_ok: u64,
+    /// 802.11 payload parsed as SOME mgmt frame (beacon/probe-req/deauth /
+    /// probe-response family recognised by dot11).
+    mgmt_80211_parsed: u64,
+    /// Beacons/probe-responses that ingested an AP row (created or already
+    /// known — i.e. recognised AP-producing frames).
+    beacons_ap_ingested: u64,
 }
 
 /// Blocking channel-hop passive scan on an interface the caller already put
@@ -226,9 +248,12 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
     let mut scanner = Scanner::new(cfg.rssi_floor);
     let mut buf = vec![0u8; 4096];
     let mut ch_idx = 0usize;
+    let mut stats = ScanStats::default();
+    let mut last_stats_log = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let ch = channels[ch_idx];
+        let cur_ch = ch;
         ch_idx = (ch_idx + 1) % channels.len();
         if let Err(e) = iface::set_channel(&cfg.ifname, ch) {
             let _ = tx.send(Event::Log(format!(
@@ -241,8 +266,18 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
         loop {
             match sock.recv(&mut buf) {
                 Ok(n) => {
-                    let now = Instant::now();
+                    stats.raw_frames_received += 1;
+                    let now = now_ms();
                     if let Some((meta, frame)) = radiotap::strip(&buf[..n]) {
+                        stats.radiotap_strip_ok += 1;
+                        if dot11::parse_beacon_or_probe(frame).is_some() {
+                            stats.mgmt_80211_parsed += 1;
+                            stats.beacons_ap_ingested += 1;
+                        } else if dot11::parse_probe_req(frame).is_some()
+                            || dot11::parse_deauth(frame).is_some()
+                        {
+                            stats.mgmt_80211_parsed += 1;
+                        }
                         scanner.ingest(&meta, frame, now, &tx);
                     }
                 }
@@ -266,7 +301,21 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
             }
         }
 
-        scanner.expire(Instant::now(), &tx);
+        // 10 s wall-time diagnostic heartbeat: distinguishes RX-silence
+        // (rx==0) from radiotap/parser drops (rx>0 but beacons==0) when a
+        // report says "only my own AP shows up".
+        if last_stats_log.elapsed() >= Duration::from_secs(10) {
+            last_stats_log = Instant::now();
+            let _ = tx.send(Event::Log(format!(
+                "scan: {} rx frames, {} beacons -> {} APs live (ch {})",
+                stats.raw_frames_received,
+                stats.beacons_ap_ingested,
+                scanner.aps.len(),
+                cur_ch
+            )));
+        }
+
+        scanner.expire(now_ms(), &tx);
     }
     Ok(())
 }
@@ -346,7 +395,7 @@ mod tests {
     fn beacon_attached_creates_ap_with_ssid_and_channel() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         sc.ingest(&meta(-42, 0), &beacon_frame(&ap(), "parafin", 6), now, &tx);
         match rx.try_recv() {
             Ok(Event::ApUpdated(a)) => {
@@ -363,7 +412,7 @@ mod tests {
     fn beacon_uses_freq_hint_when_no_ds_ie() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         let mut f = beacon_frame(&ap(), "parafin", 6);
         f.truncate(f.len() - 3); // drop DS IE
         sc.ingest(&meta(-40, 2437), &f, now, &tx);
@@ -377,7 +426,7 @@ mod tests {
     fn weak_beacon_not_created_but_update_accepted_later() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         // -90 < floor: no event, no entry.
         sc.ingest(&meta(-90, 0), &beacon_frame(&ap(), "parafin", 6), now, &tx);
         assert!(rx.try_recv().is_err());
@@ -394,7 +443,7 @@ mod tests {
     fn rssi_improvement_emits_update_worsening_does_not() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         sc.ingest(&meta(-70, 0), &beacon_frame(&ap(), "parafin", 6), now, &tx);
         let _ = rx.try_recv(); // creation
         sc.ingest(&meta(-75, 0), &beacon_frame(&ap(), "parafin", 6), now, &tx);
@@ -410,7 +459,7 @@ mod tests {
     fn probe_req_creates_client_and_data_freshens() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         sc.ingest(&meta(-55, 0), &probe_req_frame(&sta(), Some("parafin")), now, &tx);
         match rx.try_recv() {
             Ok(Event::ClientUpdated(c)) => {
@@ -431,7 +480,7 @@ mod tests {
     fn multicast_ta_is_ignored() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let now = Instant::now();
+        let now: u64 = 0;
         let mcast = MacAddr([0x33, 0x33, 0, 0, 0, 1]);
         sc.ingest(&meta(-40, 0), &probe_req_frame(&mcast, None), now, &tx);
         assert!(rx.try_recv().is_err());
@@ -442,14 +491,14 @@ mod tests {
     fn aging_emits_ap_lost_and_drops_clients() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut sc = Scanner::new(-85);
-        let t0 = Instant::now();
+        let t0: u64 = 1_000;
         sc.ingest(&meta(-40, 0), &beacon_frame(&ap(), "parafin", 6), t0, &tx);
         sc.ingest(&meta(-40, 0), &probe_req_frame(&sta(), None), t0, &tx);
         let _ = rx.try_recv();
         let _ = rx.try_recv();
 
         // 31 s later: AP expired, client still alive.
-        let t1 = t0 + Duration::from_secs(31);
+        let t1 = t0 + 31_000;
         sc.expire(t1, &tx);
         match rx.try_recv() {
             Ok(Event::ApLost(b)) => assert_eq!(b, ap()),
@@ -458,7 +507,7 @@ mod tests {
         assert!(sc.clients.contains_key(&sta()));
 
         // 61 s: client gone too.
-        sc.expire(t0 + Duration::from_secs(61), &tx);
+        sc.expire(t0 + 61_000, &tx);
         assert!(sc.clients.is_empty());
     }
 

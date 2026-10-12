@@ -1,4 +1,3 @@
-mod backend;
 mod common;
 mod crypto;
 mod deauth;
@@ -10,6 +9,7 @@ mod pmkid;
 mod radiotap;
 mod rawsock;
 mod scanner;
+mod service;
 mod ui;
 mod wordlist;
 
@@ -27,10 +27,19 @@ struct Cli {
     /// Dev mode: fabricated events, no device access. Same as WIFILAB_MOCK=1.
     #[arg(long)]
     mock: bool,
+    /// Internal: run as the privileged radio service (spawned by the UI,
+    /// directly or via pkexec). Never returns; JSON lines on stdin/stdout.
+    #[arg(long, hide = true)]
+    privileged_worker: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
+    // Privileged service path: no GUI, no extra args needed (pkexec strips
+    // the environment; everything the service needs comes over the pipe).
+    if cli.privileged_worker {
+        service::run_service(); // never returns
+    }
     let mock = cli.mock
         || matches!(
             std::env::var_os("WIFILAB_MOCK"),
@@ -49,9 +58,9 @@ fn main() {
         if mock {
             "fabricated events only"
         } else if iface::is_root() {
-            "monitor mode + injection available"
+            "monitor mode + injection available (service runs as child)"
         } else {
-            "not root — use the \"Elevate via polkit\" button in the UI header"
+            "not root — polkit will ask for authentication when you start capture"
         }
     );
     ui::run_app(cli.iface, cli.mock);

@@ -111,8 +111,8 @@ fn start(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
                 "cracker: starting on {desc} via {wordlist} [auto backend]"
             ));
             cx.notify();
-            match &app.backend {
-                Some(be) => be.crack(
+            match &app.service {
+                Some(svc) => svc.spawn_crack(
                     target.describe(),
                     target,
                     std::path::PathBuf::from(&wordlist),
@@ -122,7 +122,7 @@ fn start(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
                     app.state.cracker.running = false;
                     app.crack_inflight = false;
                     app.state
-                        .push_log("ERROR: cracker: no backend (start capture first, then stop it)");
+                        .push_log("ERROR: cracker: no service (start capture first, then stop it)");
                     cx.notify();
                 }
             }
@@ -187,8 +187,8 @@ fn stop(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
             cx.notify();
             return;
         }
-        if let Some(be) = &app.backend {
-            be.request_crack_stop();
+        if let Some(svc) = &app.service {
+            svc.request_crack_stop();
             app.state.push_log("cracker: stop requested");
         } else {
             app.state.cracker.running = false;
@@ -215,10 +215,12 @@ pub fn render(
     } else {
         0.0
     };
-    // Real mode: cracker needs the radio — capture must be stopped and a
-    // backend must exist.
+    // Real mode: cracker needs the radio free — capture must be stopped
+    // and a service must have run at least once (it owns the cracker's
+    // stop flag). After the first "Stop capture" this stays permanently
+    // unblocked: the service is kept alive across sessions.
     let crack_blocked =
-        !app.is_mock && (app.state.iface_running || app.backend.is_none());
+        !app.is_mock && (app.state.iface_running || app.service.is_none());
     let candidates = if app.is_mock {
         format!("candidates: {} / {WORDLIST_TOTAL}", cracker.tried)
     } else {

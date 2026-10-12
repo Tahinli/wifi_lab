@@ -1,5 +1,5 @@
 //! Application state: the UI-side home for everything arriving over the
-//! backend event channel. Backend swap-in keeps this type untouched.
+//! service event channel (mock thread or privileged-service reader).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -25,7 +25,7 @@ pub struct CrackerState {
 }
 
 /// Everything the window renders. Updated exclusively by
-/// [`AppState::apply`] so a real backend can reuse the reduction logic.
+/// [`AppState::apply`] so a real service can reuse the reduction logic.
 pub struct AppState {
     /// Whether the interface is (pretending to be) capturing in monitor mode.
     pub iface_running: bool,
@@ -70,7 +70,7 @@ impl AppState {
         self.log.push_back(line.into());
     }
 
-    /// Reduce one backend event into state. Returns `true` when the set of
+    /// Reduce one service event into state. Returns `true` when the set of
     /// crackable captures changed (callers rebuild dependent widgets).
     pub fn apply(&mut self, event: Event) -> bool {
         match event {

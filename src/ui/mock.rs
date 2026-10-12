@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 
 use crate::common::{
-    AccessPoint, ClientInfo, Event, HandshakeCapture, MacAddr, PmkidCapture, Security,
+    AccessPoint, ClientInfo, Event, HandshakeCapture, MacAddr, PmkidCapture, Security, now_ms,
 };
 
 /// Salted deterministic PRNG (xorshift64) — no rand crate, values only need
@@ -44,7 +44,7 @@ pub const MOCK_CLIENTS: [MacAddr; 4] = [
 ];
 
 fn seed_aps() -> Vec<AccessPoint> {
-    let now = Instant::now();
+    let now = now_ms();
     let ap = |mac: [u8; 6], ssid: &str, channel, security, rssi| AccessPoint {
         bssid: MacAddr(mac),
         ssid: ssid.to_string(),
@@ -52,7 +52,7 @@ fn seed_aps() -> Vec<AccessPoint> {
         security,
         rssi_dbm: rssi,
         beacons: 200,
-        last_seen: now,
+        last_seen_ms: now,
     };
     vec![
         ap([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], "parafin", 6, Security::Wpa2, -42),
@@ -65,13 +65,13 @@ fn seed_aps() -> Vec<AccessPoint> {
 }
 
 fn seed_clients() -> Vec<ClientInfo> {
-    let now = Instant::now();
+    let now = now_ms();
     let cl = |mac: MacAddr, ap: MacAddr, rssi| ClientInfo {
         mac,
         ap: Some(ap),
         rssi_dbm: rssi,
         frames: 40,
-        last_seen: now,
+        last_seen_ms: now,
     };
     vec![
         cl(MOCK_CLIENTS[0], MOCK_BSSID, -44),
@@ -176,19 +176,19 @@ fn run(tx: Sender<Event>) {
     loop {
         thread::sleep(Duration::from_millis(200));
         let t = started.elapsed().as_secs_f32();
-        let now = Instant::now();
+        let now = now_ms();
 
         // RSSI drift + beacon/frame counters on every tick.
         for ap in &mut aps {
             ap.rssi_dbm = (ap.rssi_dbm + (rng.below(5) as i8 - 2)).clamp(-90, -30);
             ap.beacons += rng.below(3);
-            ap.last_seen = now;
+            ap.last_seen_ms = now;
             let _ = tx.send(Event::ApUpdated(ap.clone()));
         }
         for cl in &mut clients {
             cl.rssi_dbm = (cl.rssi_dbm + (rng.below(3) as i8 - 1)).clamp(-90, -30);
             cl.frames += rng.below(12);
-            cl.last_seen = now;
+            cl.last_seen_ms = now;
             let _ = tx.send(Event::ClientUpdated(cl.clone()));
         }
 

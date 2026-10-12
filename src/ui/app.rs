@@ -1,10 +1,8 @@
 //! Root view: nav rail, header bar (interface picker, privilege badge,
 //! monitor/capture toggle), page content, status line, and the background
-//! task that polls the backend event channel.
+//! task that polls the service event channel.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -22,11 +20,11 @@ use gpuikit::input::InputState;
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
-use crate::backend::Backend;
-use crate::common::{Event, MacAddr};
+use crate::common::{Cmd, Event, MacAddr};
+use crate::service::ServiceClient;
 use crate::ui::{attacks, cracker, log as log_view, networks, state::AppState};
 
-/// How often the UI drains the backend event channel.
+/// How often the UI drains the service event channel.
 const EVENT_POLL: Duration = Duration::from_millis(100);
 
 /// Left nav destinations.
@@ -53,16 +51,19 @@ impl Page {
 
 pub struct AppRoot {
     pub state: AppState,
-    /// Backend event channel (mock thread today, real backend later).
+    /// Service event channel (mock thread or service reader thread).
     pub rx: Receiver<Event>,
     /// UI-triggered actions are injected into the same pipeline.
     pub tx: Sender<Event>,
     pub page: Page,
     /// Privilege indicator; real value from [`crate::iface::is_root`].
+    /// Informational only — the UI never needs root itself; the service
+    /// elevates via polkit when it spawns.
     pub is_root: bool,
-    /// Real radio/attack/cracker orchestrator. `None` in mock mode or
-    /// before the first "Start capture".
-    pub backend: Option<Backend>,
+    /// Privileged radio service client (owns the child process + the
+    /// UI-side cracker stop flag). `None` in mock mode or before the
+    /// first "Start capture". Kept across stop/start cycles.
+    pub service: Option<ServiceClient>,
     /// Mock data mode (`--mock` / `WIFILAB_MOCK=1`): never touches devices.
     pub is_mock: bool,
     /// Target BSSID picked on the Networks page (AP row or client row).
@@ -81,10 +82,6 @@ pub struct AppRoot {
     /// Toast queued by the event loop (no Window there) — shown on the
     /// next render pass.
     pub pending_toast: Option<SharedString>,
-    /// Elevate-via-polkit handshake: Some while a pkexec re-exec is in
-    /// flight. 0 = waiting on the polkit dialog, 1 = elevated instance
-    /// launched (quit this one), 2 = declined/failed (message was logged).
-    pub elevation: Option<Arc<AtomicU8>>,
     /// NetworkManager seen active when capture started (fights channels).
     pub nm_active: bool,
     /// Used to invalidate stale cracker simulation ticks after Stop/re-Start.
@@ -150,7 +147,7 @@ impl AppRoot {
             tx,
             page: Page::Networks,
             is_root: crate::iface::is_root(),
-            backend: None,
+            service: None,
             is_mock,
             selected: None,
             selected_client: None,
@@ -159,7 +156,6 @@ impl AppRoot {
             attacking_pmkid: false,
             crack_inflight: false,
             pending_toast: None,
-            elevation: None,
             nm_active: false,
             crack_epoch: 0,
             ap_sort: None,
@@ -178,32 +174,28 @@ impl AppRoot {
             "wifilab UI started (mock backend)".to_string()
         } else {
             format!(
-                "wifilab UI started (REAL backend, iface {selected_iface}) — Start capture to bring up monitor mode"
+                "wifilab UI started (REAL backend, iface {selected_iface}) — Start capture spawns the privileged service (polkit) and brings up monitor mode"
             )
         });
 
         cx.on_release(|this, _cx| {
-            // Window closed → root view released → stop every worker and
-            // restore the interface to managed mode.
-            if let Some(be) = this.backend.take() {
-                be.shutdown();
+            // Window closed → root view released → shut the service down
+            // (it stops workers, restores managed mode, exits) and stop
+            // any UI-side crack job.
+            if let Some(svc) = this.service.take() {
+                svc.shutdown();
             }
         })
         .detach();
 
         if !this.is_root && !this.is_mock {
-            if crate::iface::pkexec_available() {
-                cx.toast("not root — click \"Elevate via polkit\" in the header to gain privileges")
-                    .show(window, cx);
-            } else {
-                cx.toast("not root and polkit (pkexec) unavailable — monitor mode and injection will fail")
-                    .show(window, cx);
-            }
+            cx.toast("not root — polkit will ask for authentication when you start capture")
+                .show(window, cx);
         }
 
-        // Poll the backend event channel: wait on the background executor,
+        // Poll the service event channel: wait on the background executor,
         // then reduce everything queued into state on the main thread. The
-        // backend threads never touch gpui types.
+        // service reader thread never touches gpui types.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(EVENT_POLL).await;
@@ -222,10 +214,11 @@ impl AppRoot {
 
     /// Header "Start/Stop capture" behaviour.
     ///
-    /// Real mode: lazily create the [`Backend`] (monitor-mode switch +
-    /// scanner thread) on the channel-selected interface; Stop shuts it
-    /// down and restores managed mode. Mock mode: pure UI flips (the mock
-    /// generator runs independently).
+    /// Real mode: lazily spawn the privileged service (polkit-elevated
+    /// when needed) which switches the interface to monitor mode and runs
+    /// the scanner; Stop only ends the scan session — the service stays
+    /// alive for the cracker page and later scans. Mock mode: pure UI
+    /// flips (the mock generator runs independently).
     pub fn toggle_monitor(&mut self, cx: &mut Context<Self>) {
         if self.is_mock {
             self.state.iface_running = !self.state.iface_running;
@@ -239,29 +232,16 @@ impl AppRoot {
             return;
         }
         if self.state.iface_running {
-            // STOP: release the radio but KEEP the Backend alive — the
-            // cracker needs it (cracking has no radio use). `stop_radio`
-            // restores managed mode and joins the radio workers only.
-            if let Some(be) = &self.backend {
-                self.state.push_log("ui: stopping capture, restoring managed mode…");
-                cx.notify();
-                be.stop_radio();
+            // STOP: end the scan session but KEEP the service alive — the
+            // cracker needs it, and a later Start reuses it.
+            if let Some(svc) = &self.service {
                 self.state
-                    .push_log("ui: capture stopped, interface restored (cracker stays available)");
+                    .push_log("ui: stopping capture, service restores managed mode…");
+                svc.stop_scan();
             }
             self.state.iface_running = false;
             cx.notify();
         } else {
-            if !self.is_root {
-                self.state.push_log(
-                    "ui: capture REFUSED — no root privileges. Elevate via polkit first.".to_string(),
-                );
-                self.pending_toast = Some(
-                    "ELEVATION REQUIRED: click \"Elevate via polkit\" in the header before starting capture".into(),
-                );
-                cx.notify();
-                return;
-            }
             // NetworkManager fight: pin-to-connected-channel makes ONLY the
             // associated network (e.g. parafin) visible during the hop.
             if crate::iface::networkmanager_active() {
@@ -275,15 +255,22 @@ impl AppRoot {
                     "NetworkManager is active — only your connected network may be visible; stop it from the header".into(),
                 );
             }
-            // A Backend kept alive for the cracker from a previous capture
-            // would tear down our new monitor mode in its `Drop` (it
-            // restores managed mode). Drop it BEFORE the fresh
-            // `start_scan` switches the interface up in monitor mode.
-            self.backend = None;
             let ifname = self.state.ifname.clone();
-            match Backend::start_scan(&ifname, self.tx.clone()) {
-                Ok(be) => {
-                    self.backend = Some(be);
+            if let Some(svc) = &self.service {
+                // Service already up (from an earlier session): just ask
+                // for a fresh scan session.
+                svc.cmd(&Cmd::StartScan {
+                    ifname: ifname.clone(),
+                });
+                self.state.iface_running = true;
+                self.state
+                    .push_log(format!("ui: capture started on {ifname}"));
+                cx.notify();
+                return;
+            }
+            match ServiceClient::start(&ifname, self.tx.clone()) {
+                Ok(svc) => {
+                    self.service = Some(svc);
                     self.state.iface_running = true;
                     self.state
                         .push_log(format!("ui: capture started on {ifname}"));
@@ -291,88 +278,35 @@ impl AppRoot {
                 Err(e) => {
                     self.state
                         .push_log(format!("ERROR: start capture on {ifname}: {e:#}"));
+                    self.pending_toast =
+                        Some(format!("start capture failed: {e:#}").into());
                 }
             }
             cx.notify();
         }
     }
 
-    /// Stop NetworkManager (root) so it stops pinning the radio to the
-    /// connected network's channel.
+    /// Stop NetworkManager via the privileged service so it stops pinning
+    /// the radio to the connected network's channel.
     pub fn stop_nm(&mut self, cx: &mut Context<Self>) {
-        match crate::iface::stop_networkmanager() {
-            Ok(()) => {
-                self.nm_active = false;
-                self.state.push_log(
-                    "ui: NetworkManager stopped — channel hopping is now exclusive; restart it later with `systemctl start NetworkManager`"
-                        .to_string(),
-                );
-                self.pending_toast =
-                    Some("NetworkManager stopped — all networks become visible as the hopper cycles".into());
-            }
-            Err(e) => {
+        match &self.service {
+            Some(svc) => {
+                svc.cmd(&Cmd::StopNetworkManager);
                 self.state
-                    .push_log(format!("ERROR stopping NetworkManager: {e:#}"));
+                    .push_log("ui: asking service to stop NetworkManager…");
+            }
+            None => {
+                self.state.push_log(
+                    "ui: NM stop needs the privileged service — Start capture first".to_string(),
+                );
             }
         }
         cx.notify();
-    }
-
-    /// Re-exec this app as root via polkit (pkexec). The polkit dialog is
-    /// fully OS-driven; on success the elevated instance opens its own
-    /// window and this one closes itself.
-    pub fn elevate(&mut self, cx: &mut Context<Self>) {
-        if self.is_root || self.is_mock || self.elevation.is_some() {
-            return;
-        }
-        if self.backend.is_some() {
-            self.state.push_log("ui: stop capture before elevating");
-            cx.notify();
-            return;
-        }
-        let flag = Arc::new(AtomicU8::new(0));
-        self.elevation = Some(flag.clone());
-        let ifname = self.state.ifname.clone();
-        let tx = self.tx.clone();
-        self.state.push_log(format!(
-            "ui: requesting administrative privileges via polkit (restarting elevated on {ifname})…"
-        ));
-        cx.notify();
-        std::thread::spawn(move || {
-            match crate::iface::relaunch_elevated(&["--iface", ifname.as_str()]) {
-                Ok(st) if st.success() => flag.store(1, Ordering::SeqCst),
-                Ok(st) => {
-                    flag.store(2, Ordering::SeqCst);
-                    let _ = tx.send(Event::Log(format!(
-                        "ui: elevation dialog dismissed or failed (pkexec exit {st})"
-                    )));
-                }
-                Err(e) => {
-                    flag.store(2, Ordering::SeqCst);
-                    let _ = tx.send(Event::Error(format!("polkit elevation failed: {e:#}")));
-                }
-            }
-        });
     }
 
     /// Drain every queued event, track handshake progress, refresh widgets
     /// derived from the capture set.
     fn drain_events(&mut self, cx: &mut Context<Self>) {
-        // Elevation handshake: success → the new elevated window is up,
-        // close this one; failure → allow retry (message already queued).
-        if let Some(flag) = &self.elevation {
-            match flag.load(Ordering::SeqCst) {
-                1 => {
-                    self.state
-                        .push_log("ui: elevated instance started — closing this window");
-                    self.elevation = None;
-                    cx.quit();
-                    return;
-                }
-                2 => self.elevation = None,
-                _ => {}
-            }
-        }
         let mut changed = false;
         let mut captures_changed = false;
         while let Ok(event) = self.rx.try_recv() {
@@ -388,8 +322,20 @@ impl AppRoot {
                 Event::PmkidCaptured(_) => {
                     self.attacking_pmkid = false;
                 }
+                // Service child died (EOF seen by the reader thread):
+                // un-flip every running flag and drop the client so the
+                // next Start spawns a fresh, alive service.
+                Event::Error(line) if line == "service terminated" => {
+                    self.attacking_handshake = false;
+                    self.attacking_pmkid = false;
+                    self.state.iface_running = false;
+                    self.crack_inflight = false;
+                    if let Some(svc) = self.service.take() {
+                        svc.shutdown(); // reaps the corpse, restores iface
+                    }
+                }
                 // Any worker error, or a terminal log from an attack
-                // worker (prefixed by backend.rs; scanner logs are
+                // worker (prefixed by the service; scanner logs are
                 // excluded), un-spins attack buttons so the UI is never
                 // stuck "working…".
                 Event::Error(_) => {
@@ -403,6 +349,16 @@ impl AppRoot {
                 {
                     self.attacking_handshake = false;
                     self.attacking_pmkid = false;
+                }
+                // Service-side NM result: `nm: stopped` / `nm: stop failed …`.
+                Event::Log(line) if line.starts_with("nm:") => {
+                    if line == "nm: stopped" {
+                        self.nm_active = false;
+                        self.pending_toast = Some(
+                            "NetworkManager stopped — all networks become visible as the hopper cycles"
+                                .into(),
+                        );
+                    }
                 }
                 Event::CrackStopped { .. } => {
                     self.crack_inflight = false;
@@ -493,28 +449,8 @@ impl AppRoot {
         } else if self.is_mock {
             badge("not root (mock)").secondary()
         } else {
-            badge("not root — elevate to attack").destructive()
+            badge("user (service will elevate)").secondary()
         };
-
-        let elevate_btn = (!self.is_root && !self.is_mock && crate::iface::pkexec_available())
-            .then(|| {
-                let waiting = self.elevation.is_some();
-                button(
-                    "elevate-btn",
-                    if waiting {
-                        "waiting for polkit…"
-                    } else {
-                        "Elevate via polkit"
-                    },
-                )
-                .disabled(waiting)
-                .on_click({
-                    let view = view.clone();
-                    move |_, _window, cx| {
-                        view.update(cx, |app, cx| app.elevate(cx));
-                    }
-                })
-            });
 
         let toggle = button(
             "monitor-toggle",
@@ -538,7 +474,7 @@ impl AppRoot {
 
         let nm_badge = (self.nm_active && !self.is_mock)
             .then(|| badge("NM active — channels pinned").destructive());
-        let nm_btn = (self.nm_active && self.is_root && !self.is_mock).then(|| {
+        let nm_btn = (self.nm_active && !self.is_mock).then(|| {
             button("stop-nm", "Stop NM").on_click({
                 let view = view.clone();
                 move |_, _window, cx| {
@@ -558,7 +494,6 @@ impl AppRoot {
             .bg(theme.surface())
             .child(div().text_lg().font_weight(FontWeight::BOLD).child("wifilab"))
             .child(privilege)
-            .children(elevate_btn)
             .child(div().w(px(220.)).child(self.iface_select.clone()))
             .children(nm_badge)
             .children(nm_btn)

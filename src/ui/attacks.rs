@@ -16,7 +16,7 @@ use gpuikit::elements::typography::{h3, small, text};
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
-use crate::common::{Event, HandshakeCapture, MacAddr, PmkidCapture};
+use crate::common::{Cmd, Event, HandshakeCapture, MacAddr, PmkidCapture};
 use crate::ui::app::AppRoot;
 use crate::ui::mock;
 
@@ -135,8 +135,8 @@ fn capture_handshake(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui
             app.state.push_log(format!(
                 "handshake capture on {essid} ({ap}, ch {channel})…"
             ));
-            if let Some(be) = &app.backend {
-                be.capture_hs(ap, channel, essid, app.tx.clone());
+            if let Some(svc) = &app.service {
+                svc.cmd(&Cmd::CaptureHs { ap, channel, essid });
             }
             cx.notify();
             return;
@@ -222,8 +222,8 @@ fn pmkid_attack(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App
             };
             app.state
                 .push_log(format!("pmkid attack on {essid} ({ap}, ch {channel})…"));
-            if let Some(be) = &app.backend {
-                be.pmkid(ap, channel, essid, app.tx.clone());
+            if let Some(svc) = &app.service {
+                svc.cmd(&Cmd::Pmkid { ap, channel, essid });
             }
             cx.notify();
             return;
@@ -282,9 +282,9 @@ fn deauth(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
                 cx.notify();
                 return;
             }
-            let Some(be) = &app.backend else {
+            let Some(svc) = &app.service else {
                 app.state
-                    .push_log("deauth: start capture first (the backend owns the radio)");
+                    .push_log("deauth: start capture first (the service owns the radio)");
                 cx.notify();
                 return;
             };
@@ -310,7 +310,12 @@ fn deauth(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
             app.state.push_log(format!(
                 "deauth: {count} rounds → {target} (AP {ap}, ch {channel})"
             ));
-            be.deauth(ap, target, channel, count, app.tx.clone());
+            svc.cmd(&Cmd::Deauth {
+                ap,
+                target,
+                channel,
+                count,
+            });
             cx.notify();
             return;
         }
@@ -396,8 +401,8 @@ pub fn render(
     let no_target = app.selected.is_none();
     // Real mode without a running capture has no radio: block the buttons
     // (a matching hint sits next to them).
-    let no_backend = !app.is_mock && !app.state.iface_running;
-    let blocked = no_target || no_backend;
+    let not_running = !app.is_mock && !app.state.iface_running;
+    let blocked = no_target || not_running;
     let hs_running = app.attacking_handshake;
     let pm_running = app.attacking_pmkid;
 
@@ -437,7 +442,7 @@ pub fn render(
         .when(hs_running || pm_running, |el| {
             el.child(loading_indicator().small()).child(small("working…"))
         })
-        .when(no_backend, |el| {
+        .when(not_running, |el| {
             el.child(small("start capture first to enable attacks"))
         });
 
