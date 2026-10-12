@@ -293,6 +293,27 @@ impl Backend {
         });
     }
 
+    /// Stop radio work (scanner + attack workers) and restore managed
+    /// mode, but KEEP the Backend alive so the cracker can still run
+    /// afterwards: the UI keeps `Some(backend)` after "Stop capture".
+    /// A still-running crack job is untouched (it has no radio use).
+    /// Idempotent; a later `start_scan` simply replaces this Backend.
+    pub fn stop_radio(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(mon) = &self.mon_ifname {
+            if let Err(e) = iface::to_managed(mon) {
+                eprintln!("wifilab: to_managed({mon}) failed: {e:#}");
+            }
+        }
+        // Safe to join radio handles here: the UI disables the capture
+        // toggle while a crack runs, so no unfinished crack thread sits
+        // in this list.
+        let handles = std::mem::take(&mut *self.handles.lock().expect("handles poisoned"));
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
     /// Stop every worker, restore the original interface to managed mode
     /// (deleting the `<orig>mon` vif if one was created), and join all
     /// threads. Idempotent: safe to call more than once / from `Drop`.

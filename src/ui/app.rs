@@ -238,14 +238,18 @@ impl AppRoot {
             cx.notify();
             return;
         }
-        if let Some(be) = self.backend.take() {
+        if self.state.iface_running {
+            // STOP: release the radio but KEEP the Backend alive — the
+            // cracker needs it (cracking has no radio use). `stop_radio`
+            // restores managed mode and joins the radio workers only.
+            if let Some(be) = &self.backend {
+                self.state.push_log("ui: stopping capture, restoring managed mode…");
+                cx.notify();
+                be.stop_radio();
+                self.state
+                    .push_log("ui: capture stopped, interface restored (cracker stays available)");
+            }
             self.state.iface_running = false;
-            // The crack job (if any) has its own stop flag and keeps
-            // running; it never touches the radio.
-            self.state.push_log("ui: stopping capture, restoring managed mode…");
-            cx.notify();
-            be.shutdown();
-            self.state.push_log("ui: capture stopped, interface restored");
             cx.notify();
         } else {
             if !self.is_root {
@@ -271,6 +275,11 @@ impl AppRoot {
                     "NetworkManager is active — only your connected network may be visible; stop it from the header".into(),
                 );
             }
+            // A Backend kept alive for the cracker from a previous capture
+            // would tear down our new monitor mode in its `Drop` (it
+            // restores managed mode). Drop it BEFORE the fresh
+            // `start_scan` switches the interface up in monitor mode.
+            self.backend = None;
             let ifname = self.state.ifname.clone();
             match Backend::start_scan(&ifname, self.tx.clone()) {
                 Ok(be) => {

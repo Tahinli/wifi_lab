@@ -115,9 +115,9 @@ fn capture_handshake(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui
         if app.attacking_handshake {
             return;
         }
-        if !app.is_mock && app.backend.is_none() {
+        if !app.is_mock && !app.state.iface_running {
             app.state
-                .push_log("handshake: start capture first (the backend owns the radio)");
+                .push_log("handshake: start capture first (attacks need the radio in monitor mode)");
             cx.notify();
             return;
         }
@@ -203,9 +203,9 @@ fn pmkid_attack(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App
         if app.attacking_pmkid {
             return;
         }
-        if !app.is_mock && app.backend.is_none() {
+        if !app.is_mock && !app.state.iface_running {
             app.state
-                .push_log("pmkid: start capture first (the backend owns the radio)");
+                .push_log("pmkid: start capture first (attacks need the radio in monitor mode)");
             cx.notify();
             return;
         }
@@ -276,6 +276,12 @@ fn deauth(view: &Entity<AppRoot>, _window: &mut Window, cx: &mut gpui::App) {
             .unwrap_or(16);
 
         if !app.is_mock {
+            if !app.state.iface_running {
+                app.state
+                    .push_log("deauth: start capture first (injection needs monitor mode)");
+                cx.notify();
+                return;
+            }
             let Some(be) = &app.backend else {
                 app.state
                     .push_log("deauth: start capture first (the backend owns the radio)");
@@ -390,7 +396,7 @@ pub fn render(
     let no_target = app.selected.is_none();
     // Real mode without a running capture has no radio: block the buttons
     // (a matching hint sits next to them).
-    let no_backend = !app.is_mock && app.backend.is_none();
+    let no_backend = !app.is_mock && !app.state.iface_running;
     let blocked = no_target || no_backend;
     let hs_running = app.attacking_handshake;
     let pm_running = app.attacking_pmkid;
