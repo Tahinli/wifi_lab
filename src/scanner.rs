@@ -220,6 +220,12 @@ struct ScanStats {
     /// Beacons/probe-responses that ingested an AP row (created or already
     /// known — i.e. recognised AP-producing frames).
     beacons_ap_ingested: u64,
+    /// Frames with beacon/probe-response FC byte, REGARDLESS of whether the
+    /// IE walk later succeeded — the parser-independent RX witness.
+    beacon_fc_rx: u64,
+    /// addr3 histogram of beacon_fc frames: answers "are other BSSIDs even
+    /// reaching the card" without trusting any parser.
+    bssid_hist: std::collections::BTreeMap<crate::common::MacAddr, u64>,
 }
 
 /// Blocking channel-hop passive scan on an interface the caller already put
@@ -270,6 +276,18 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
                     let now = now_ms();
                     if let Some((meta, frame)) = radiotap::strip(&buf[..n]) {
                         stats.radiotap_strip_ok += 1;
+                        // Parser-independent witness: beacon (0x80) and
+                        // probe-response (0x50) frames carry the transmitter
+                        // BSSID at addr3 (bytes 16..22) before any IE parse.
+                        if frame.len() >= 24 && (frame[0] == 0x80 || frame[0] == 0x50) {
+                            stats.beacon_fc_rx += 1;
+                            let mut mac = [0u8; 6];
+                            mac.copy_from_slice(&frame[16..22]);
+                            *stats
+                                .bssid_hist
+                                .entry(crate::common::MacAddr(mac))
+                                .or_insert(0) += 1;
+                        }
                         if dot11::parse_beacon_or_probe(frame).is_some() {
                             stats.mgmt_80211_parsed += 1;
                             stats.beacons_ap_ingested += 1;
@@ -306,12 +324,25 @@ pub fn run(cfg: ScannerConfig, tx: Sender<Event>, stop: Arc<AtomicBool>) -> Resu
         // report says "only my own AP shows up".
         if last_stats_log.elapsed() >= Duration::from_secs(10) {
             last_stats_log = Instant::now();
+            let top: String = {
+                let mut v: Vec<(crate::common::MacAddr, u64)> =
+                    stats.bssid_hist.iter().map(|(m, c)| (*m, *c)).collect();
+                v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                v.truncate(4);
+                v.iter()
+                    .map(|(m, c)| format!("{m}({c})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             let _ = tx.send(Event::Log(format!(
-                "scan: {} rx frames, {} beacons -> {} APs live (ch {})",
+                "scan: rx={} strip={} beaconfc={} beacons={} aps={} ch={} top=[{}]",
                 stats.raw_frames_received,
+                stats.radiotap_strip_ok,
+                stats.beacon_fc_rx,
                 stats.beacons_ap_ingested,
                 scanner.aps.len(),
-                cur_ch
+                cur_ch,
+                top
             )));
         }
 
