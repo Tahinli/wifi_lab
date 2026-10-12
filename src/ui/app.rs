@@ -261,6 +261,7 @@ impl AppRoot {
                 // for a fresh scan session.
                 svc.cmd(&Cmd::StartScan {
                     ifname: ifname.clone(),
+                    channels: None,
                 });
                 self.state.iface_running = true;
                 self.state

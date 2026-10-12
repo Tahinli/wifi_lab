@@ -222,7 +222,13 @@ pub enum Cmd {
     /// Switch `ifname` to monitor mode and start the channel-hopping
     /// scanner. `ifname` is saved as the interface to restore on
     /// StopScan/Shutdown.
-    StartScan { ifname: String },
+    StartScan {
+        ifname: String,
+        /// Optional static channel list (diagnostics: park on one channel
+        /// instead of hopping). `None`/empty = full hop list.
+        #[serde(default)]
+        channels: Option<Vec<u8>>,
+    },
     /// Stop the scanner, restore managed mode.
     StopScan,
     /// Blast `count` deauth rounds at `target` (broadcast allowed) from
@@ -378,6 +384,7 @@ mod tests {
         let cases: Vec<Cmd> = vec![
             Cmd::StartScan {
                 ifname: "wlp14s0".into(),
+                channels: None,
             },
             Cmd::StopScan,
             Cmd::Deauth {

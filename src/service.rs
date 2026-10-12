@@ -98,7 +98,7 @@ impl RadioService {
     /// [`Event::Error`] is emitted, the interface is put back into managed
     /// mode (best effort). A previous scan session must be stopped first
     /// (or have failed); the stop flag is always fresh here.
-    fn start_scan(&mut self, ifname: &str) {
+    fn start_scan(&mut self, ifname: &str, channels: &[u8]) {
         self.stop = Arc::new(AtomicBool::new(false));
         self.mon_ifname = None;
         self.orig_ifname = Some(ifname.to_string());
@@ -118,7 +118,7 @@ impl RadioService {
 
         let cfg = scanner::ScannerConfig {
             ifname: mon_ifname,
-            channels: Vec::new(), // empty = full hop list
+            channels: channels.to_vec(), // empty = full hop list
             dwell_ms: 100,
             rssi_floor: -95,
         };
@@ -355,7 +355,9 @@ fn service_main() -> i32 {
             }
         };
         match cmd {
-            Cmd::StartScan { ifname } => radio.start_scan(&ifname),
+            Cmd::StartScan { ifname, channels } => {
+                radio.start_scan(&ifname, channels.as_deref().unwrap_or(&[]))
+            }
             Cmd::StopScan => radio.stop_scan(),
             Cmd::Deauth {
                 ap,
@@ -536,6 +538,7 @@ impl ServiceClient {
         };
         client.cmd(&Cmd::StartScan {
             ifname: ifname.to_string(),
+            channels: None,
         });
         Ok(client)
     }
