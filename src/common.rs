@@ -235,8 +235,11 @@ pub const HOP_FREQS_ALL: &[u16] = &[
     // 5 GHz ch 36..64 and 100..140
     5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620,
     5640, 5660, 5680, 5700,
-    // 6 GHz PSC
-    5980, 6060, 6140, 6220, 6300, 6380,
+    // 6 GHz: ONLY the phy-advertised 20 MHz channel grid (5955 + 20n,
+    // ch 1/5/9/…/85). PSC channel centers (5980/6060/…) are NOT advertised
+    // by iwlwifi and the kernel rejects them with "Unknown channel".
+    5955, 5975, 5995, 6015, 6035, 6055, 6075, 6095, 6115, 6135, 6155, 6175, 6195, 6215, 6235,
+    6255, 6275, 6295, 6315, 6335, 6355, 6375, 6395, 6415,
 ];
 
 /// Commands the UI process sends to the privileged service
