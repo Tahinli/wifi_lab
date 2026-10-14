@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 
 use crate::common::{
-    AccessPoint, ClientInfo, Event, HandshakeCapture, MacAddr, PmkidCapture, Security, now_ms,
+    AccessPoint, Akm, ChannelStat, ClientInfo, Event, HandshakeCapture, MacAddr, PmkidCapture,
+    ProbeInfo, Security, now_ms,
 };
 
 /// Salted deterministic PRNG (xorshift64) — no rand crate, values only need
@@ -43,9 +44,14 @@ pub const MOCK_CLIENTS: [MacAddr; 4] = [
     MacAddr([0x44, 0x55, 0x66, 0x77, 0x88, 0x99]),
 ];
 
+/// Locally-administered MACs the mock pairs into one device group (the
+/// MAC-randomization storyline: ROT1 visible from start, ROT2 "rotates in").
+pub const MOCK_ROT1: MacAddr = MacAddr([0x02, 0xa0, 0xb1, 0xc2, 0xd3, 0xe4]);
+pub const MOCK_ROT2: MacAddr = MacAddr([0x06, 0x5f, 0x4e, 0x3d, 0x2c, 0x1b]);
+
 fn seed_aps() -> Vec<AccessPoint> {
     let now = now_ms();
-    let ap = |mac: [u8; 6], ssid: &str, channel, security, rssi| AccessPoint {
+    let ap = |mac: [u8; 6], ssid: &str, channel, security, rssi, akms: Vec<Akm>| AccessPoint {
         bssid: MacAddr(mac),
         ssid: ssid.to_string(),
         channel,
@@ -53,31 +59,96 @@ fn seed_aps() -> Vec<AccessPoint> {
         rssi_dbm: rssi,
         beacons: 200,
         last_seen_ms: now,
+        akms,
     };
     vec![
-        ap([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], "parafin", 6, Security::Wpa2, -42),
-        ap([0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e], "labnet", 1, Security::Wpa2, -55),
-        ap([0x02, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e], "coffeeshop", 11, Security::Wpa2, -68),
-        ap([0x02, 0xff, 0xee, 0xdd, 0xcc, 0xbb], "corp-wpa3", 36, Security::Wpa3, -61),
-        ap([0x02, 0xde, 0xad, 0xbe, 0xef, 0x00], "legacy-prn", 3, Security::Wep, -80),
-        ap([0x02, 0x00, 0x11, 0x22, 0x33, 0x44], "open-wifi", 6, Security::Open, -72),
+        ap(
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            "parafin",
+            6,
+            Security::Wpa2,
+            -42,
+            vec![Akm::Psk],
+        ),
+        ap(
+            [0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e],
+            "labnet",
+            1,
+            Security::Wpa2,
+            -55,
+            vec![Akm::Psk],
+        ),
+        ap(
+            [0x02, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e],
+            "coffeeshop",
+            11,
+            Security::Wpa2,
+            -68,
+            vec![Akm::Psk],
+        ),
+        ap(
+            [0x02, 0xff, 0xee, 0xdd, 0xcc, 0xbb],
+            "corp-wpa3",
+            36,
+            Security::Wpa3,
+            -61,
+            vec![Akm::Psk, Akm::Sae],
+        ),
+        ap(
+            [0x02, 0xde, 0xad, 0xbe, 0xef, 0x00],
+            "legacy-prn",
+            3,
+            Security::Wep,
+            -80,
+            Vec::new(),
+        ),
+        ap(
+            [0x02, 0x00, 0x11, 0x22, 0x33, 0x44],
+            "open-wifi",
+            6,
+            Security::Open,
+            -72,
+            Vec::new(),
+        ),
+        // Same SSID as `parafin` but OPEN + different BSSID: trips the
+        // UI's rogue-AP detection so the warning path is visible in mock.
+        ap(
+            [0x02, 0x66, 0x66, 0x66, 0x66, 0x66],
+            "parafin",
+            11,
+            Security::Open,
+            -77,
+            Vec::new(),
+        ),
     ]
 }
 
 fn seed_clients() -> Vec<ClientInfo> {
     let now = now_ms();
-    let cl = |mac: MacAddr, ap: MacAddr, rssi| ClientInfo {
+    let cl = |mac: MacAddr, ap: MacAddr, rssi, connected: bool| ClientInfo {
         mac,
         ap: Some(ap),
         rssi_dbm: rssi,
         frames: 40,
         last_seen_ms: now,
+        connected,
+        ident_group: None,
+        ident_conf: None,
     };
     vec![
-        cl(MOCK_CLIENTS[0], MOCK_BSSID, -44),
-        cl(MOCK_CLIENTS[1], MOCK_BSSID, -51),
-        cl(MOCK_CLIENTS[2], MacAddr([0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]), -60),
-        cl(MOCK_CLIENTS[3], MacAddr([0x02, 0xff, 0xee, 0xdd, 0xcc, 0xbb]), -63),
+        cl(MOCK_CLIENTS[0], MOCK_BSSID, -44, true),
+        cl(MOCK_CLIENTS[1], MOCK_BSSID, -51, true),
+        cl(MOCK_CLIENTS[2], MacAddr([0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]), -60, true),
+        // Locally-administered (randomized) MAC — the ROT2 milestone below
+        // pairs it with ROT1 as one physical radio.
+        cl(MOCK_ROT1, MOCK_BSSID, -48, true),
+        // Deauth-flagged so the disconnected state is visible in mock mode.
+        cl(
+            MOCK_CLIENTS[3],
+            MacAddr([0x02, 0xff, 0xee, 0xdd, 0xcc, 0xbb]),
+            -63,
+            false,
+        ),
     ]
 }
 
@@ -148,7 +219,7 @@ pub fn spawn_mock(tx: Sender<Event>) {
 
 fn run(tx: Sender<Event>) {
     let _ = tx.send(Event::Log(format!(
-        "mock: scanning on {MOCK_IFACE} (6 APs, 4 clients)"
+        "mock: scanning on {MOCK_IFACE} (7 APs, 4 clients)"
     )));
 
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -163,6 +234,21 @@ fn run(tx: Sender<Event>) {
 
     let started = Instant::now();
     let mut stage = 0usize;
+    let mut tick = 0u64;
+    // Drifting cumulative per-channel counters for the ChannelStats feed.
+    let mut chan_frames: [u64; 4] = [120, 980, 340, 60];
+    let mut chan_beacons: [u64; 4] = [40, 210, 90, 12];
+    // Probe-request feed cycles these (client, ssid) pairs.
+    const PROBE_FEED: &[(MacAddr, Option<&str>)] = &[
+        (MOCK_CLIENTS[0], Some("HOME-WIFI")),
+        (MOCK_CLIENTS[1], Some("labnet")),
+        (MOCK_CLIENTS[2], None),
+        (MOCK_CLIENTS[3], Some("coffeeshop")),
+        (MOCK_CLIENTS[1], None),
+    ];
+    let mut probe_step = 0usize;
+    let mut ident_fed = false;
+    let mut deauth_alert_sent = false;
     const LOG_LINES: &[&str] = &[
         "hop: ch 1 → ch 6",
         "probe request from 11:22:33:44:55:66 (\"labnet\")",
@@ -175,8 +261,72 @@ fn run(tx: Sender<Event>) {
 
     loop {
         thread::sleep(Duration::from_millis(200));
+        tick += 1;
         let t = started.elapsed().as_secs_f32();
         let now = now_ms();
+
+        // Per-channel activity snapshot every ~2 s (10 ticks).
+        if tick % 10 == 0 {
+            let mut stats = Vec::with_capacity(4);
+            for (i, ch) in [1u8, 6, 11, 36].iter().enumerate() {
+                chan_frames[i] += 20 + rng.below(180);
+                chan_beacons[i] += rng.below(6);
+                stats.push(ChannelStat {
+                    channel: *ch,
+                    frames: chan_frames[i],
+                    beacons: chan_beacons[i],
+                });
+            }
+            let _ = tx.send(Event::ChannelStats(stats));
+        }
+
+        // Probe-request feed every ~3 s (15 ticks).
+        if tick % 15 == 0 {
+            let (client, ssid) = PROBE_FEED[probe_step % PROBE_FEED.len()];
+            probe_step += 1;
+            let _ = tx.send(Event::ProbeObserved(ProbeInfo {
+                client,
+                ssid: ssid.map(str::to_string),
+                rssi_dbm: -(40 + rng.below(45) as i8),
+                at_ms: now,
+            }));
+        }
+
+        // MAC-rotation storyline at ~6 s: a new randomized MAC appears and
+        // the correlator pairs both into device group #1.
+        if !ident_fed && t >= 6.0 {
+            ident_fed = true;
+            let _ = tx.send(Event::ClientIdent {
+                mac: MOCK_ROT1,
+                group: 1,
+                confidence: crate::common::IdentConfidence::Strong,
+            });
+            let _ = tx.send(Event::ClientUpdated(ClientInfo {
+                mac: MOCK_ROT2,
+                ap: Some(MOCK_BSSID),
+                rssi_dbm: -46,
+                frames: 3,
+                last_seen_ms: now,
+                connected: true,
+                ident_group: None,
+                ident_conf: None,
+            }));
+            let _ = tx.send(Event::ClientIdent {
+                mac: MOCK_ROT2,
+                group: 1,
+                confidence: crate::common::IdentConfidence::Strong,
+            });
+        }
+
+        // One foreign-deauth storm milestone at ~12 s.
+        if !deauth_alert_sent && t >= 12.0 {
+            deauth_alert_sent = true;
+            let _ = tx.send(Event::DeauthAlert {
+                source: MOCK_BSSID,
+                target: MacAddr::BROADCAST,
+                count: 64,
+            });
+        }
 
         // RSSI drift + beacon/frame counters on every tick.
         for ap in &mut aps {

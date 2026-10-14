@@ -8,7 +8,7 @@ mod app;
 mod attacks;
 mod cracker;
 mod log;
-mod mock;
+pub(crate) mod mock;
 mod networks;
 pub mod state;
 
